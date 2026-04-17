@@ -1,0 +1,38 @@
+[package]
+name = "wm"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 3: xdg-shell compositor hosting real Wayland clients."
+
+[dependencies]
+# Smithay is pulled from git because the crates.io release (0.3) is
+# significantly behind the API surface used by the reference compositor
+# `anvil` and the wider ecosystem.
+#
+# Features:
+#   - backend_winit     : run nested inside the host display server.
+#   - backend_egl       : EGL context/surface bindings (required by winit + GL).
+#   - renderer_gl       : the GlesRenderer we clear the screen with.
+#   - wayland_frontend  : enables the `wayland::*` modules (CompositorState,
+#                         ShmState, XdgShellState, seat globals, …) so real
+#                         Wayland clients can connect and talk to us.
+#   - desktop           : `Space`, `Window`, `render_output` — the
+#                         convenience layer for mapping/rendering toplevels
+#                         without hand-rolling the damage + z-order math.
+smithay = { git = "https://github.com/Smithay/smithay", default-features = false, features = [
+    "backend_winit",
+    "backend_egl",
+    "renderer_gl",
+    "wayland_frontend",
+    "desktop",
+] }
+
+# Structured logging. `tracing` is the facade we annotate with; the
+# subscriber is what actually formats and writes events to stderr.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev]
+# Smithay + GL can be slow in debug; opt-level=1 is a good compromise
+# between fast compile times and interactive-feeling iteration.
+opt-level = 1

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/sicakahve/.cargo/git/checkouts/smithay-312425d48e59d8c8/dba255c/src/**)",
+      "Bash(cargo build *)"
+    ]
+  }
+}
