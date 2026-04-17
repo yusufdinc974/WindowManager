@@ -1,4 +1,4 @@
-//! Phase 6b: bare-metal DRM/udev/GBM rendering.
+//! Phase 7: Workspaces (Virtual Desktops).
 
 use std::{
     collections::HashSet,
@@ -100,6 +100,27 @@ use smithay::{
 use tracing::{debug, info, trace, warn};
 
 const CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
+const NUM_WORKSPACES: usize = 9;
+
+// -------------------------------------------------------------------------
+// Workspace
+// -------------------------------------------------------------------------
+
+pub struct Workspace {
+    pub space: Space<Window>,
+    pub windows: Vec<Window>,
+}
+
+impl Workspace {
+    pub fn new(output: &Output) -> Self {
+        let mut space = Space::default();
+        space.map_output(output, (0, 0));
+        Self {
+            space,
+            windows: Vec::new(),
+        }
+    }
+}
 
 // -------------------------------------------------------------------------
 // Compositor state
@@ -118,6 +139,8 @@ pub enum KeyAction {
     FocusRight,
     MoveWindowLeft,
     MoveWindowRight,
+    SwitchWorkspace(usize),
+    MoveToWorkspace(usize),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -146,14 +169,13 @@ pub struct State {
     pub pointer: PointerHandle<Self>,
     pub pointer_location: Point<f64, Logical>,
 
-    pub space: Space<Window>,
-    pub windows: Vec<Window>,
+    pub workspaces: Vec<Workspace>,
+    pub active_workspace: usize,
     pub output: Output,
     pub popups: PopupManager,
 
     /// Set to true whenever the scene changes and a new frame should
-    /// be rendered. The periodic calloop callback checks this and
-    /// kicks off a render when the VBlank-driven loop isn't running.
+    /// be rendered.
     pub needs_redraw: bool,
 }
 
@@ -229,7 +251,9 @@ impl CompositorHandler for State {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            if let Some(window) = self
+
+            let ws = &self.workspaces[self.active_workspace];
+            if let Some(window) = ws
                 .space
                 .elements()
                 .find(|w| w.toplevel().unwrap().wl_surface() == &root)
@@ -238,7 +262,7 @@ impl CompositorHandler for State {
             }
         }
 
-        handle_initial_configure(surface, &self.space);
+        handle_initial_configure(surface, &self.workspaces[self.active_workspace].space);
 
         // A client committed new content — we need to repaint.
         self.needs_redraw = true;
@@ -295,11 +319,15 @@ impl XdgShellHandler for State {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        info!("new xdg toplevel");
+        info!(
+            workspace = self.active_workspace + 1,
+            "new xdg toplevel on workspace"
+        );
 
         let window = Window::new_wayland_window(surface);
-        self.windows.push(window.clone());
-        self.recalculate_layout();
+        let ws = &mut self.workspaces[self.active_workspace];
+        ws.windows.push(window.clone());
+        Self::recalculate_layout_for(ws, &self.output);
 
         let wl_surface = window.toplevel().unwrap().wl_surface().clone();
         let serial = SERIAL_COUNTER.next_serial();
@@ -319,24 +347,46 @@ impl XdgShellHandler for State {
         info!("xdg toplevel destroyed");
 
         let dying = surface.wl_surface().clone();
-        self.windows
-            .retain(|w| w.toplevel().map(|t| t.wl_surface()) != Some(&dying));
 
-        let dead = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&dying))
-            .cloned();
-        if let Some(window) = dead {
-            self.space.unmap_elem(&window);
+        // Find which workspace owns this surface and clean it up.
+        for (i, ws) in self.workspaces.iter_mut().enumerate() {
+            let had_window = ws.windows.len();
+            ws.windows
+                .retain(|w| w.toplevel().map(|t| t.wl_surface()) != Some(&dying));
+
+            if ws.windows.len() != had_window {
+                let dead = ws
+                    .space
+                    .elements()
+                    .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&dying))
+                    .cloned();
+                if let Some(window) = dead {
+                    ws.space.unmap_elem(&window);
+                }
+                // We can't call Self::recalculate_layout_for here because
+                // we have a mutable borrow on self.workspaces via the
+                // iterator. We'll note the index and do it after.
+                info!(workspace = i + 1, "removed destroyed toplevel from workspace");
+                break;
+            }
         }
 
-        let focus = self.windows.first().and_then(|w| w.toplevel()).map(|t| t.wl_surface().clone());
+        // Recalculate layout for all workspaces that might have changed.
+        // In practice only one did, but this is cheap and correct.
+        for ws in self.workspaces.iter_mut() {
+            Self::recalculate_layout_for(ws, &self.output);
+        }
+
+        // Update keyboard focus to whatever is on top of the active workspace.
+        let focus = self.workspaces[self.active_workspace]
+            .windows
+            .first()
+            .and_then(|w| w.toplevel())
+            .map(|t| t.wl_surface().clone());
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, focus, serial);
 
-        self.recalculate_layout();
         self.needs_redraw = true;
 
         if let Err(err) = self.display_handle.flush_clients() {
@@ -410,23 +460,25 @@ impl XdgDecorationHandler for State {
 delegate_xdg_decoration!(State);
 
 // -------------------------------------------------------------------------
-// Tiling layout
+// Tiling layout & workspace operations
 // -------------------------------------------------------------------------
 
 impl State {
-    pub fn recalculate_layout(&mut self) {
-        let Some(geo) = self.space.output_geometry(&self.output) else {
+    /// Static helper — operates on a single workspace so we can call it
+    /// without needing `&mut self` (avoids borrow-checker gymnastics).
+    pub fn recalculate_layout_for(ws: &mut Workspace, output: &Output) {
+        let Some(geo) = ws.space.output_geometry(output) else {
             return;
         };
         let origin = geo.loc;
         let (screen_w, screen_h) = (geo.size.w, geo.size.h);
 
-        match self.windows.len() {
+        match ws.windows.len() {
             0 => {}
             1 => {
                 place_tile(
-                    &mut self.space,
-                    &self.windows[0],
+                    &mut ws.space,
+                    &ws.windows[0],
                     origin,
                     (screen_w, screen_h),
                 );
@@ -439,13 +491,13 @@ impl State {
                 let slice_h = screen_h / stack_count;
 
                 place_tile(
-                    &mut self.space,
-                    &self.windows[0],
+                    &mut ws.space,
+                    &ws.windows[0],
                     origin,
                     (master_w, screen_h),
                 );
 
-                for (i, window) in self.windows.iter().skip(1).enumerate() {
+                for (i, window) in ws.windows.iter().skip(1).enumerate() {
                     let i = i as i32;
                     let y = origin.y + i * slice_h;
                     let h = if i == stack_count - 1 {
@@ -453,14 +505,22 @@ impl State {
                     } else {
                         slice_h
                     };
-                    place_tile(&mut self.space, window, (stack_x, y).into(), (stack_w, h));
+                    place_tile(&mut ws.space, window, (stack_x, y).into(), (stack_w, h));
                 }
             }
         }
     }
 
+    /// Convenience: recalculate the active workspace.
+    pub fn recalculate_layout(&mut self) {
+        let output = self.output.clone();
+        let ws = &mut self.workspaces[self.active_workspace];
+        Self::recalculate_layout_for(ws, &output);
+    }
+
     pub fn focus_window(&mut self, window: &Window) {
-        self.space.raise_element(window, true);
+        let ws = &mut self.workspaces[self.active_workspace];
+        ws.space.raise_element(window, true);
         let surface = window
             .toplevel()
             .map(|t| t.wl_surface().clone());
@@ -474,7 +534,9 @@ impl State {
             info!("close_focused: nothing is focused");
             return;
         };
-        let Some(idx) = self
+
+        let ws = &mut self.workspaces[self.active_workspace];
+        let Some(idx) = ws
             .windows
             .iter()
             .position(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&focused))
@@ -482,13 +544,19 @@ impl State {
             warn!("close_focused: focused surface does not belong to a tracked window");
             return;
         };
-        let window = self.windows.remove(idx);
+        let window = ws.windows.remove(idx);
         if let Some(toplevel) = window.toplevel() {
             toplevel.send_close();
         }
-        self.space.unmap_elem(&window);
+        ws.space.unmap_elem(&window);
 
-        let next_focus = self
+        let output = self.output.clone();
+        Self::recalculate_layout_for(
+            &mut self.workspaces[self.active_workspace],
+            &output,
+        );
+
+        let next_focus = self.workspaces[self.active_workspace]
             .windows
             .first()
             .and_then(|w| w.toplevel())
@@ -497,18 +565,18 @@ impl State {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, next_focus, serial);
 
-        self.recalculate_layout();
         self.needs_redraw = true;
     }
 
     pub fn focus_relative(&mut self, delta: isize) {
-        if self.windows.is_empty() {
+        let ws = &self.workspaces[self.active_workspace];
+        if ws.windows.is_empty() {
             return;
         }
-        let len = self.windows.len() as isize;
+        let len = ws.windows.len() as isize;
         let current = self.keyboard.current_focus();
         let current_idx = current.as_ref().and_then(|focused| {
-            self.windows
+            ws.windows
                 .iter()
                 .position(|w| w.toplevel().map(|t| t.wl_surface()) == Some(focused))
         });
@@ -516,8 +584,109 @@ impl State {
             Some(i) => (i as isize + delta).rem_euclid(len) as usize,
             None => 0,
         };
-        let next = self.windows[next_idx].clone();
+        let next = ws.windows[next_idx].clone();
         self.focus_window(&next);
+    }
+
+    // ── Workspace operations ────────────────────────────────────────
+
+    pub fn switch_workspace(&mut self, idx: usize) {
+        if idx >= self.workspaces.len() {
+            warn!(idx, "switch_workspace: index out of range");
+            return;
+        }
+        if idx == self.active_workspace {
+            debug!(workspace = idx + 1, "already on this workspace");
+            return;
+        }
+
+        info!(
+            from = self.active_workspace + 1,
+            to = idx + 1,
+            "switching workspace"
+        );
+
+        self.active_workspace = idx;
+
+        // Update keyboard focus to whatever is on top of the new workspace.
+        let focus = self.workspaces[self.active_workspace]
+            .windows
+            .last()
+            .and_then(|w| w.toplevel())
+            .map(|t| t.wl_surface().clone());
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, focus, serial);
+
+        self.needs_redraw = true;
+    }
+
+    pub fn move_to_workspace(&mut self, target_idx: usize) {
+        if target_idx >= self.workspaces.len() {
+            warn!(target_idx, "move_to_workspace: index out of range");
+            return;
+        }
+        if target_idx == self.active_workspace {
+            debug!(
+                workspace = target_idx + 1,
+                "move_to_workspace: window is already on this workspace"
+            );
+            return;
+        }
+
+        let Some(focused) = self.keyboard.current_focus() else {
+            info!("move_to_workspace: nothing is focused");
+            return;
+        };
+
+        let src_idx = self.active_workspace;
+
+        // Find the window in the source workspace.
+        let src_ws = &mut self.workspaces[src_idx];
+        let Some(win_idx) = src_ws
+            .windows
+            .iter()
+            .position(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&focused))
+        else {
+            warn!("move_to_workspace: focused surface not found in active workspace");
+            return;
+        };
+
+        let window = src_ws.windows.remove(win_idx);
+        src_ws.space.unmap_elem(&window);
+
+        info!(
+            from = src_idx + 1,
+            to = target_idx + 1,
+            "moving window to workspace"
+        );
+
+        // Add to target workspace.
+        let dst_ws = &mut self.workspaces[target_idx];
+        dst_ws.windows.push(window);
+
+        // Recalculate layout for both workspaces.
+        let output = self.output.clone();
+        Self::recalculate_layout_for(
+            &mut self.workspaces[src_idx],
+            &output,
+        );
+        Self::recalculate_layout_for(
+            &mut self.workspaces[target_idx],
+            &output,
+        );
+
+        // Update focus on the source (active) workspace.
+        let next_focus = self.workspaces[src_idx]
+            .windows
+            .last()
+            .and_then(|w| w.toplevel())
+            .map(|t| t.wl_surface().clone());
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, next_focus, serial);
+
+        self.needs_redraw = true;
     }
 }
 
@@ -575,7 +744,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    info!("bootstrapping bare-metal Wayland compositor (Phase 6b: DRM/udev)");
+    info!("bootstrapping bare-metal Wayland compositor (Phase 7: Workspaces)");
 
     let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
     let loop_signal = event_loop.get_signal();
@@ -640,9 +809,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("seat 'seat0' initialised with keyboard + pointer capabilities");
 
-    // ---- Space + map output -------------------------------------------
-    let mut space: Space<Window> = Space::default();
-    space.map_output(&output, (0, 0));
+    // ---- Workspaces ---------------------------------------------------
+    let workspaces: Vec<Workspace> = (0..NUM_WORKSPACES)
+        .map(|_| Workspace::new(&output))
+        .collect();
+    info!(count = NUM_WORKSPACES, "workspaces initialised");
 
     // ---- Wayland listening socket ------------------------------------
     let listening_socket = ListeningSocketSource::new_auto()?;
@@ -828,8 +999,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyboard,
         pointer,
         pointer_location: Point::from((0.0, 0.0)),
-        space,
-        windows: Vec::new(),
+        workspaces,
+        active_workspace: 0,
         output,
         popups: PopupManager::default(),
         needs_redraw: true,
@@ -856,13 +1027,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     warn!(?err, "periodic flush_clients failed");
                 }
             }
-            data.state.space.refresh();
+
+            let ws = &mut data.state.workspaces[data.state.active_workspace];
+            ws.space.refresh();
             data.state.popups.cleanup();
 
             // If the VBlank-driven render loop has stopped (no pending
             // frame) and something has changed, kick off a new render.
-            // This is the mechanism that restarts rendering after the
-            // loop dies due to no-damage frames.
             if data.state.needs_redraw && !data.backend.pending_frame {
                 render_frame(data);
             }
@@ -887,6 +1058,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // -------------------------------------------------------------------------
 // Keyboard filter
 // -------------------------------------------------------------------------
+
+/// Map a keysym _1 .. _9 to a 0-based workspace index.
+fn keysym_to_workspace_index(sym: Keysym) -> Option<usize> {
+    match sym {
+        Keysym::_1 => Some(0),
+        Keysym::_2 => Some(1),
+        Keysym::_3 => Some(2),
+        Keysym::_4 => Some(3),
+        Keysym::_5 => Some(4),
+        Keysym::_6 => Some(5),
+        Keysym::_7 => Some(6),
+        Keysym::_8 => Some(7),
+        Keysym::_9 => Some(8),
+        _ => None,
+    }
+}
 
 fn handle_keybinding(
     _state: &mut State,
@@ -913,7 +1100,19 @@ fn handle_keybinding(
             s if s == Keysym::r || s == Keysym::R   => KeyAction::ReloadConfig,
             Keysym::Left                             => KeyAction::MoveWindowLeft,
             Keysym::Right                            => KeyAction::MoveWindowRight,
-            _ => return FilterResult::Forward,
+            _ => {
+                // Super+Shift+[1-9] → MoveToWorkspace
+                // When shift is held, xkb gives us the shifted symbol
+                // (e.g. '!' for Shift+1 on US layout). We need the
+                // *raw* (unshifted) keysym to detect number keys.
+                let raw_sym = keysym_handle.raw_syms().first().copied()
+                    .unwrap_or(sym);
+                if let Some(idx) = keysym_to_workspace_index(raw_sym) {
+                    KeyAction::MoveToWorkspace(idx)
+                } else {
+                    return FilterResult::Forward;
+                }
+            }
         }
     } else {
         // ── Super only ──────────────────────────────────────────────
@@ -926,7 +1125,14 @@ fn handle_keybinding(
             Keysym::space                            => KeyAction::ToggleFloating,
             Keysym::Left                             => KeyAction::FocusLeft,
             Keysym::Right                            => KeyAction::FocusRight,
-            _ => return FilterResult::Forward,
+            _ => {
+                // Super+[1-9] → SwitchWorkspace
+                if let Some(idx) = keysym_to_workspace_index(sym) {
+                    KeyAction::SwitchWorkspace(idx)
+                } else {
+                    return FilterResult::Forward;
+                }
+            }
         }
     };
 
@@ -963,6 +1169,12 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         KeyAction::MoveWindowRight => {
             info!("Action MoveWindow not yet implemented");
         }
+        KeyAction::SwitchWorkspace(idx) => {
+            state.switch_workspace(idx);
+        }
+        KeyAction::MoveToWorkspace(idx) => {
+            state.move_to_workspace(idx);
+        }
     }
 }
 
@@ -991,7 +1203,10 @@ fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputBacke
         InputEvent::PointerMotion { event } => {
             state.pointer_location.x += event.delta_x();
             state.pointer_location.y += event.delta_y();
-            if let Some(geo) = state.space.output_geometry(&state.output) {
+            if let Some(geo) = state.workspaces[state.active_workspace]
+                .space
+                .output_geometry(&state.output)
+            {
                 state.pointer_location.x =
                     state.pointer_location.x.clamp(0.0, geo.size.w as f64);
                 state.pointer_location.y =
@@ -1008,7 +1223,8 @@ fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputBacke
             if event.state() != ButtonState::Pressed {
                 return;
             }
-            let hit = state
+            let ws = &state.workspaces[state.active_workspace];
+            let hit = ws
                 .space
                 .element_under(state.pointer_location)
                 .map(|(w, _)| w.clone());
@@ -1257,7 +1473,8 @@ fn render_frame(data: &mut CalloopData) {
         return;
     }
 
-    let spaces = [&state.space];
+    let active_space = &state.workspaces[state.active_workspace].space;
+    let spaces = [active_space];
     let elements = match space_render_elements(
         &mut backend.renderer,
         spaces,
@@ -1281,10 +1498,6 @@ fn render_frame(data: &mut CalloopData) {
     ) {
         Ok(frame) => {
             if frame.is_empty {
-                // No damage this frame. The DrmCompositor won't accept
-                // queue_frame (returns EmptyFrame), so the VBlank loop
-                // stops here. That's fine — the periodic calloop callback
-                // will call render_frame again when needs_redraw is set.
                 trace!("no damage — VBlank loop paused until next redraw");
                 state.needs_redraw = false;
             } else if let Err(err) = backend.compositor.queue_frame(()) {
@@ -1301,13 +1514,19 @@ fn render_frame(data: &mut CalloopData) {
 
     let now = state.start_time.elapsed();
     let output = state.output.clone();
-    state.space.elements().for_each(|window| {
-        window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
-    });
 
-    state.space.refresh();
+    // Send frame callbacks to windows on ALL workspaces so that
+    // background clients don't stall waiting for a
+    // wl_callback.done that never arrives.
+    for ws in state.workspaces.iter() {
+        ws.space.elements().for_each(|window| {
+            window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        });
+    }
+
+    state.workspaces[state.active_workspace].space.refresh();
     state.popups.cleanup();
 
     if let Err(err) = state.display_handle.flush_clients() {
@@ -1329,8 +1548,6 @@ fn handle_drm_event(event: DrmEvent, data: &mut CalloopData) {
             if let Err(err) = data.backend.compositor.frame_submitted() {
                 warn!(?err, "DRM: frame_submitted failed");
             }
-            // Render next frame immediately — this keeps the VBlank
-            // loop going as long as there's new content.
             render_frame(data);
         }
         DrmEvent::Error(err) => {
