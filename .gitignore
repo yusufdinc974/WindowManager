@@ -12,3 +12,6 @@
 
 # Environment variables (just in case you add them later)
 .env
+
+#logs
+*.log
