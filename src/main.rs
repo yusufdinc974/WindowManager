@@ -116,6 +116,8 @@ pub enum KeyAction {
     ToggleFloating,
     FocusLeft,
     FocusRight,
+    MoveWindowLeft,
+    MoveWindowRight,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -896,51 +898,71 @@ fn handle_keybinding(
         return FilterResult::Forward;
     }
 
-    if !(mods.logo && mods.shift && !mods.ctrl && !mods.alt) {
+    // We only handle chords that include Super, with no Ctrl or Alt.
+    if !mods.logo || mods.ctrl || mods.alt {
         return FilterResult::Forward;
     }
 
     let sym = keysym_handle.modified_sym();
-    debug!(?mods, sym = ?sym, "chord pressed (Super+Shift)");
 
-    let action = match sym {
-        Keysym::Escape => KeyAction::Quit,
-        Keysym::Return => KeyAction::SpawnTerminal,
-        Keysym::space => KeyAction::ToggleFloating,
-        Keysym::Left => KeyAction::FocusLeft,
-        Keysym::Right => KeyAction::FocusRight,
-        s if s == Keysym::r || s == Keysym::R => KeyAction::ReloadConfig,
-        s if s == Keysym::d || s == Keysym::D => KeyAction::SpawnLauncher,
-        s if s == Keysym::q || s == Keysym::Q => KeyAction::CloseFocused,
-        s if s == Keysym::f || s == Keysym::F => KeyAction::ToggleFullscreen,
-        _ => return FilterResult::Forward,
+    let action = if mods.shift {
+        // ── Super + Shift ───────────────────────────────────────────
+        debug!(?mods, sym = ?sym, "chord pressed (Super+Shift)");
+        match sym {
+            Keysym::Escape                          => KeyAction::Quit,
+            s if s == Keysym::r || s == Keysym::R   => KeyAction::ReloadConfig,
+            Keysym::Left                             => KeyAction::MoveWindowLeft,
+            Keysym::Right                            => KeyAction::MoveWindowRight,
+            _ => return FilterResult::Forward,
+        }
+    } else {
+        // ── Super only ──────────────────────────────────────────────
+        debug!(?mods, sym = ?sym, "chord pressed (Super)");
+        match sym {
+            Keysym::Return                           => KeyAction::SpawnTerminal,
+            s if s == Keysym::d || s == Keysym::D    => KeyAction::SpawnLauncher,
+            s if s == Keysym::q || s == Keysym::Q    => KeyAction::CloseFocused,
+            s if s == Keysym::f || s == Keysym::F    => KeyAction::ToggleFullscreen,
+            Keysym::space                            => KeyAction::ToggleFloating,
+            Keysym::Left                             => KeyAction::FocusLeft,
+            Keysym::Right                            => KeyAction::FocusRight,
+            _ => return FilterResult::Forward,
+        }
     };
+
     FilterResult::Intercept(action)
 }
 
 fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
+    let Some(action) = action else { return };
+
     match action {
-        Some(KeyAction::Quit) => {
+        KeyAction::Quit => {
             info!("kill switch triggered (Super+Shift+Escape) — stopping");
             state.loop_signal.stop();
         }
-        Some(KeyAction::SpawnTerminal) => spawn_terminal(),
-        Some(KeyAction::CloseFocused) => state.close_focused(),
-        Some(KeyAction::FocusRight) => state.focus_relative(1),
-        Some(KeyAction::FocusLeft) => state.focus_relative(-1),
-        Some(KeyAction::ReloadConfig) => {
+        KeyAction::SpawnTerminal => spawn_terminal(),
+        KeyAction::CloseFocused => state.close_focused(),
+        KeyAction::FocusRight => state.focus_relative(1),
+        KeyAction::FocusLeft => state.focus_relative(-1),
+        KeyAction::ReloadConfig => {
             info!("Action ReloadConfig not yet implemented");
         }
-        Some(KeyAction::SpawnLauncher) => {
+        KeyAction::SpawnLauncher => {
             info!("Action SpawnLauncher not yet implemented");
         }
-        Some(KeyAction::ToggleFullscreen) => {
+        KeyAction::ToggleFullscreen => {
             info!("Action ToggleFullscreen not yet implemented");
         }
-        Some(KeyAction::ToggleFloating) => {
+        KeyAction::ToggleFloating => {
             info!("Action ToggleFloating not yet implemented");
         }
-        None => {}
+        KeyAction::MoveWindowLeft => {
+            info!("Action MoveWindow not yet implemented");
+        }
+        KeyAction::MoveWindowRight => {
+            info!("Action MoveWindow not yet implemented");
+        }
     }
 }
 
