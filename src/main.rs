@@ -43,6 +43,7 @@ use smithay::{
     reexports::{
         calloop::{
             generic::Generic,
+            timer::{TimeoutAction, Timer},
             EventLoop, Interest, Mode as CalloopMode, PostAction,
             RegistrationToken,
         },
@@ -81,7 +82,7 @@ mod state;
 use config::Config;
 use input::{handle_ipc_command, handle_libinput_event, IpcCommand};
 use state::{
-    CalloopData, ClientState, DrmBackend, State, Workspace, DEFAULT_CLEAR_COLOR,
+    CalloopData, ClientState, DrmBackend, State, Workspace,
 };
 
 // -------------------------------------------------------------------------
@@ -183,8 +184,17 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
             info!(bus = %addr, "session: launched private DBus session bus");
         }
         Err(err) => {
-            warn!(?err, "session: failed to launch private DBus — removing bus address");
-            std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
+            if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok() {
+                warn!(
+                    ?err,
+                    "session: failed to launch private DBus — keeping inherited bus address"
+                );
+            } else {
+                warn!(
+                    ?err,
+                    "session: no DBus session bus available — Waybar and other clients may fail to start"
+                );
+            }
         }
     }
 
@@ -200,18 +210,14 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
 fn setup_isolated_home(
     real_home: &str,
     isolated_home: &str,
-    moz_dir: &str,
-    tb_dir: &str,
+    _moz_dir: &str,
+    _tb_dir: &str,
 ) {
-    // Directories that contain per-instance lock files and must NOT
-    // be shared across TTY sessions.
     let isolated_dirs = [".mozilla", ".thunderbird"];
 
     let real = std::path::Path::new(real_home);
     let iso = std::path::Path::new(isolated_home);
 
-    // Read the real home and symlink all top-level entries except the
-    // ones we're isolating.
     let entries = match std::fs::read_dir(real) {
         Ok(e) => e,
         Err(err) => {
@@ -225,19 +231,34 @@ fn setup_isolated_home(
         let name_str = name.to_string_lossy();
         let target = iso.join(&name);
 
-        // Skip if already exists (idempotent).
         if target.exists() || target.symlink_metadata().is_ok() {
             continue;
         }
 
         if isolated_dirs.iter().any(|d| name_str == *d) {
-            // Don't symlink — we'll set up fresh directories instead.
             continue;
         }
 
-        // Create a symlink: isolated_home/<entry> -> real_home/<entry>
+        // For .config, make it a REAL directory and symlink its contents
+        // so we can write new files (like waybar config) into it
+        if name_str == ".config" {
+            let real_config = entry.path();
+            let iso_config = iso.join(".config");
+            let _ = std::fs::create_dir_all(&iso_config);
+
+            if let Ok(config_entries) = std::fs::read_dir(&real_config) {
+                for ce in config_entries.flatten() {
+                    let ce_name = ce.file_name();
+                    let ce_target = iso_config.join(&ce_name);
+                    if !ce_target.exists() && ce_target.symlink_metadata().is_err() {
+                        let _ = std::os::unix::fs::symlink(ce.path(), &ce_target);
+                    }
+                }
+            }
+            continue;
+        }
+
         if let Err(err) = std::os::unix::fs::symlink(entry.path(), &target) {
-            // Not fatal — the entry just won't be visible.
             tracing::trace!(
                 ?err,
                 entry = %name_str,
@@ -246,24 +267,17 @@ fn setup_isolated_home(
         }
     }
 
-    // Set up .mozilla pointing to our isolated directory.
-    let iso_moz = iso.join(".mozilla");
-    if !iso_moz.exists() {
-        // Create .mozilla/firefox inside isolated home.
-        let iso_moz_ff = iso.join(".mozilla").join("firefox");
-        let _ = std::fs::create_dir_all(&iso_moz_ff);
-    }
+    // Ensure isolated .mozilla and .thunderbird exist as real dirs
+    let iso_moz_ff = iso.join(".mozilla").join("firefox");
+    let _ = std::fs::create_dir_all(&iso_moz_ff);
 
-    // Same for .thunderbird.
     let iso_tb = iso.join(".thunderbird");
-    if !iso_tb.exists() {
-        let _ = std::fs::create_dir_all(&iso_tb);
-    }
+    let _ = std::fs::create_dir_all(&iso_tb);
 
     info!(
         real_home,
         isolated_home,
-        "session: isolated HOME set up with symlinks"
+        "session: isolated HOME set up"
     );
 }
 
@@ -447,6 +461,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ══════════════════════════════════════════════════════════════════
     isolate_session_environment(&socket_name);
 
+    ensure_waybar_config();
+
     event_loop
         .handle()
         .insert_source(listening_socket, |stream, _meta, data| {
@@ -597,7 +613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // ── Autostart (runs AFTER env isolation) ──
-    {
+      {
         let autostart_result: Result<mlua::Value, _> =
             lua.load("return wm.autostart").eval();
         if let Ok(mlua::Value::Table(cmds)) = autostart_result {
@@ -606,15 +622,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match std::process::Command::new("sh")
                     .arg("-c")
                     .arg(&cmd)
+                    .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .spawn()
                 {
                     Ok(child) => info!(pid = child.id(), "autostart: process spawned"),
-                    Err(err) => warn!(?err, %cmd, "autostart: failed to spawn"),
+                    Err(err) => warn!(?err, "autostart: failed to spawn"),
                 }
             }
         }
+    }
+
+
+    /// Write the default Waybar config and CSS if they don't exist yet.
+    /// Must be called AFTER isolate_session_environment() so HOME points
+    /// to the correct (possibly isolated) directory.
+    fn ensure_waybar_config() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            warn!("ensure_waybar_config: HOME is empty, skipping");
+            return;
+        }
+
+        let waybar_dir = format!("{}/.config/waybar", home);
+        
+        // If waybar dir is a symlink (from setup_isolated_home), remove it
+        // and create a real directory so we control the config
+        let waybar_path = std::path::Path::new(&waybar_dir);
+        if waybar_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            info!(path = %waybar_dir, "removing waybar config symlink to write our own");
+            let _ = std::fs::remove_file(&waybar_dir);
+        }
+        
+        if let Err(err) = std::fs::create_dir_all(&waybar_dir) {
+            warn!(?err, dir = %waybar_dir, "failed to create waybar config dir");
+            return;
+        }
+
+        // Always overwrite config to ensure it matches our compositor
+        let config_path = format!("{}/config", waybar_dir);
+        info!(path = %config_path, "writing waybar config");
+        let _ = std::fs::write(&config_path, include_str!("../assets/waybar-config.json"));
+
+        let style_path = format!("{}/style.css", waybar_dir);
+        info!(path = %style_path, "writing waybar style.css");
+        let _ = std::fs::write(&style_path, include_str!("../assets/waybar-style.css"));
+
+        let script_dir = format!("{}/.config/mywm/scripts", home);
+        let _ = std::fs::create_dir_all(&script_dir);
+
+        let script_path = format!("{}/mywm-workspaces.sh", script_dir);
+        info!(path = %script_path, "writing workspace script for waybar");
+        let _ = std::fs::write(&script_path, include_str!("../assets/mywm-workspaces.sh"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &script_path,
+                std::fs::Permissions::from_mode(0o755),
+            );
+        }
+
+        info!(waybar_dir = %waybar_dir, "waybar config ensured");
     }
 
     let state = State {
@@ -653,12 +723,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend: drm_backend,
     };
 
-    event_loop.handle().insert_idle(|data| {
-        info!("DRM: rendering first frame to bootstrap flip loop");
-        render_frame(data);
+     event_loop.handle().insert_idle(|data| {
+        info!("broadcasting initial workspace state for waybar");
+        data.state.broadcast_workspace_state();
     });
 
-    info!("entering calloop event loop");
+    // Re-broadcast workspace state periodically so waybar picks it up
+    // once it finishes connecting (it starts via autostart with a slight delay).
+    let broadcast_timer = Timer::from_duration(Duration::from_millis(500));
+    event_loop.handle().insert_source(broadcast_timer, |_, _, data| {
+        data.state.broadcast_workspace_state();
+        TimeoutAction::ToDuration(Duration::from_secs(2))
+    })?;
 
     event_loop.run(
         Some(Duration::from_millis(16)),
@@ -694,6 +770,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(session);
 
     let _ = std::fs::remove_file(ipc_socket_path);
+    let _ = std::fs::remove_file(crate::state::workspace_ipc_path());
+    let _ = std::fs::remove_file(crate::state::workspace_ipc_stream_path());
 
     // Kill our private dbus-daemon so it doesn't linger.
     kill_private_dbus_session();

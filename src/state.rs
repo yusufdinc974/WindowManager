@@ -3,6 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::io::Write;
+use std::os::unix::net::UnixStream;
+
 use mlua::Lua;
 
 use smithay::{
@@ -412,135 +415,6 @@ impl State {
         self.needs_redraw = true;
     }
 
-    pub fn switch_workspace(&mut self, idx: usize) {
-        if idx >= self.workspaces.len() {
-            warn!(idx, "switch_workspace: index out of range");
-            return;
-        }
-        if idx == self.active_workspace {
-            debug!(workspace = idx + 1, "already on this workspace");
-            return;
-        }
-
-        info!(
-            from = self.active_workspace + 1,
-            to = idx + 1,
-            layout = %self.workspaces[idx].layout,
-            "switching workspace"
-        );
-
-        self.active_workspace = idx;
-
-        let focus = self.workspaces[self.active_workspace]
-            .windows
-            .last()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, focus, serial);
-
-        self.recalculate_layout();
-        self.needs_redraw = true;
-    }
-
-    pub fn move_to_workspace(&mut self, target_idx: usize) {
-        if target_idx >= self.workspaces.len() {
-            warn!(target_idx, "move_to_workspace: index out of range");
-            return;
-        }
-        if target_idx == self.active_workspace {
-            debug!(
-                workspace = target_idx + 1,
-                "move_to_workspace: window is already on this workspace"
-            );
-            return;
-        }
-
-        let Some(focused) = self.keyboard.current_focus() else {
-            info!("move_to_workspace: nothing is focused");
-            return;
-        };
-
-        if self.layer_has_keyboard_focus() {
-            return;
-        }
-
-        let src_idx = self.active_workspace;
-
-        let src_ws = &mut self.workspaces[src_idx];
-        let Some(win_idx) = src_ws
-            .windows
-            .iter()
-            .position(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&focused))
-        else {
-            warn!("move_to_workspace: focused surface not found in active workspace");
-            return;
-        };
-
-        let window = src_ws.windows.remove(win_idx);
-        let spawn_time = src_ws.spawn_times.remove(&window);
-        let configured_size = src_ws.configured_sizes.remove(&window);
-        let was_floating = src_ws.floating.remove(&window);
-        let float_geo = src_ws.floating_geo.remove(&window);
-        src_ws.space.unmap_elem(&window);
-        src_ws.stack_ratios.clear();
-
-        info!(
-            from = src_idx + 1,
-            to = target_idx + 1,
-            "moving window to workspace"
-        );
-
-        let dst_ws = &mut self.workspaces[target_idx];
-        if let Some(t) = spawn_time {
-            dst_ws.spawn_times.insert(window.clone(), t);
-        }
-        if let Some(sz) = configured_size {
-            dst_ws.configured_sizes.insert(window.clone(), sz);
-        }
-        if was_floating {
-            dst_ws.floating.insert(window.clone());
-        }
-        if let Some(geo) = float_geo {
-            dst_ws.floating_geo.insert(window.clone(), geo);
-        }
-        dst_ws.windows.push(window);
-        dst_ws.stack_ratios.clear();
-
-        let next_focus = self.workspaces[src_idx]
-            .windows
-            .last()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, next_focus.clone(), serial);
-
-        let output = self.output.clone();
-        let outer = self.config.outer_gaps;
-        let inner = self.config.inner_gaps;
-        let border = self.config.border_width;
-        Self::recalculate_layout_for(
-            &mut self.workspaces[src_idx],
-            &output,
-            outer,
-            inner,
-            border,
-            next_focus.as_ref(),
-        );
-        Self::recalculate_layout_for(
-            &mut self.workspaces[target_idx],
-            &output,
-            outer,
-            inner,
-            border,
-            None,
-        );
-
-        self.needs_redraw = true;
-    }
-
     pub fn any_animating(&self) -> bool {
         let now = Instant::now();
         self.workspaces.iter().any(|ws| {
@@ -676,5 +550,248 @@ impl State {
             return;
         }
         self.needs_redraw = true;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Workspace IPC — broadcasts workspace state to listeners (Waybar, etc.)
+// -------------------------------------------------------------------------
+
+/// JSON representation of workspace state, consumed by Waybar's custom module.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkspaceIpcState {
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkspaceInfo {
+    pub index: usize,
+    pub name: String,
+    pub active: bool,
+    pub occupied: bool,
+    pub window_count: usize,
+    pub layout: String,
+}
+
+impl State {
+    /// Build the current workspace state snapshot.
+    pub fn workspace_ipc_state(&self) -> WorkspaceIpcState {
+        let mut workspaces = Vec::with_capacity(self.workspaces.len());
+        for (i, ws) in self.workspaces.iter().enumerate() {
+            let name = self
+                .config
+                .workspace_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| (i + 1).to_string());
+            workspaces.push(WorkspaceInfo {
+                index: i + 1,
+                name,
+                active: i == self.active_workspace,
+                occupied: !ws.windows.is_empty(),
+                window_count: ws.windows.len(),
+                layout: format!("{}", ws.layout),
+            });
+        }
+        WorkspaceIpcState { workspaces }
+    }
+
+    /// Write current workspace state to the IPC socket file so Waybar
+    /// (and other tools) can read it.
+    pub fn broadcast_workspace_state(&self) {
+        let state = self.workspace_ipc_state();
+        let json = match serde_json::to_string(&state) {
+            Ok(j) => j,
+            Err(err) => {
+                warn!(?err, "workspace IPC: failed to serialize state");
+                return;
+            }
+        };
+
+        let ipc_path = workspace_ipc_path();
+
+        // Write atomically: write to .tmp then rename
+        let tmp_path = format!("{}.tmp", ipc_path);
+        match std::fs::write(&tmp_path, &json) {
+            Ok(()) => {
+                if let Err(err) = std::fs::rename(&tmp_path, &ipc_path) {
+                    warn!(?err, "workspace IPC: rename failed");
+                }
+            }
+            Err(err) => {
+                warn!(?err, "workspace IPC: write failed");
+            }
+        }
+
+        // Also notify any connected stream listeners
+        self.notify_workspace_listeners(&json);
+    }
+
+    /// Notify connected Waybar listener sockets.
+    fn notify_workspace_listeners(&self, json: &str) {
+        let sock_path = workspace_ipc_stream_path();
+        // Best-effort: connect and write, don't block if nobody is listening
+        if let Ok(mut stream) = UnixStream::connect(&sock_path) {
+            let _ = stream.set_nonblocking(true);
+            let _ = stream.write_all(json.as_bytes());
+            let _ = stream.write_all(b"\n");
+        }
+    }
+
+    // Update existing methods to broadcast on workspace change:
+
+    pub fn switch_workspace(&mut self, idx: usize) {
+        if idx >= self.workspaces.len() {
+            warn!(idx, "switch_workspace: index out of range");
+            return;
+        }
+        if idx == self.active_workspace {
+            debug!(workspace = idx + 1, "already on this workspace");
+            return;
+        }
+
+        info!(
+            from = self.active_workspace + 1,
+            to = idx + 1,
+            layout = %self.workspaces[idx].layout,
+            "switching workspace"
+        );
+
+        self.active_workspace = idx;
+
+        let focus = self.workspaces[self.active_workspace]
+            .windows
+            .last()
+            .and_then(|w| w.toplevel())
+            .map(|t| t.wl_surface().clone());
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, focus, serial);
+
+        self.recalculate_layout();
+        self.needs_redraw = true;
+
+        // ── Broadcast workspace change ──
+        self.broadcast_workspace_state();
+    }
+
+    pub fn move_to_workspace(&mut self, target_idx: usize) {
+        if target_idx >= self.workspaces.len() {
+            warn!(target_idx, "move_to_workspace: index out of range");
+            return;
+        }
+        if target_idx == self.active_workspace {
+            debug!(
+                workspace = target_idx + 1,
+                "move_to_workspace: window is already on this workspace"
+            );
+            return;
+        }
+
+        let Some(focused) = self.keyboard.current_focus() else {
+            info!("move_to_workspace: nothing is focused");
+            return;
+        };
+
+        if self.layer_has_keyboard_focus() {
+            return;
+        }
+
+        let src_idx = self.active_workspace;
+
+        let src_ws = &mut self.workspaces[src_idx];
+        let Some(win_idx) = src_ws
+            .windows
+            .iter()
+            .position(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&focused))
+        else {
+            warn!("move_to_workspace: focused surface not found in active workspace");
+            return;
+        };
+
+        let window = src_ws.windows.remove(win_idx);
+        let spawn_time = src_ws.spawn_times.remove(&window);
+        let configured_size = src_ws.configured_sizes.remove(&window);
+        let was_floating = src_ws.floating.remove(&window);
+        let float_geo = src_ws.floating_geo.remove(&window);
+        src_ws.space.unmap_elem(&window);
+        src_ws.stack_ratios.clear();
+
+        info!(
+            from = src_idx + 1,
+            to = target_idx + 1,
+            "moving window to workspace"
+        );
+
+        let dst_ws = &mut self.workspaces[target_idx];
+        if let Some(t) = spawn_time {
+            dst_ws.spawn_times.insert(window.clone(), t);
+        }
+        if let Some(sz) = configured_size {
+            dst_ws.configured_sizes.insert(window.clone(), sz);
+        }
+        if was_floating {
+            dst_ws.floating.insert(window.clone());
+        }
+        if let Some(geo) = float_geo {
+            dst_ws.floating_geo.insert(window.clone(), geo);
+        }
+        dst_ws.windows.push(window);
+        dst_ws.stack_ratios.clear();
+
+        let next_focus = self.workspaces[src_idx]
+            .windows
+            .last()
+            .and_then(|w| w.toplevel())
+            .map(|t| t.wl_surface().clone());
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, next_focus.clone(), serial);
+
+        let output = self.output.clone();
+        let outer = self.config.outer_gaps;
+        let inner = self.config.inner_gaps;
+        let border = self.config.border_width;
+        Self::recalculate_layout_for(
+            &mut self.workspaces[src_idx],
+            &output,
+            outer,
+            inner,
+            border,
+            next_focus.as_ref(),
+        );
+        Self::recalculate_layout_for(
+            &mut self.workspaces[target_idx],
+            &output,
+            outer,
+            inner,
+            border,
+            None,
+        );
+
+        self.needs_redraw = true;
+
+        // ── Broadcast workspace change ──
+        self.broadcast_workspace_state();
+    }
+}
+
+// -------------------------------------------------------------------------
+// IPC path helpers
+// -------------------------------------------------------------------------
+
+pub fn workspace_ipc_path() -> String {
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        format!("{}/mywm-workspaces.json", runtime)
+    } else {
+        "/tmp/mywm-workspaces.json".to_string()
+    }
+}
+
+pub fn workspace_ipc_stream_path() -> String {
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        format!("{}/mywm-workspaces.sock", runtime)
+    } else {
+        "/tmp/mywm-workspaces.sock".to_string()
     }
 }

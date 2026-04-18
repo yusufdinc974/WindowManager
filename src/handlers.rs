@@ -290,6 +290,8 @@ impl XdgShellHandler for State {
                 warn!(?err, "flush_clients failed after new_toplevel");
             }
         }
+
+        self.broadcast_workspace_state();
         debug!("new_toplevel complete");
     }
 
@@ -368,6 +370,7 @@ impl XdgShellHandler for State {
                 warn!(?err, "flush_clients failed after toplevel_destroyed");
             }
         }
+        self.broadcast_workspace_state();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

@@ -25,7 +25,6 @@ use smithay::{
 };
 use tracing::{debug, info, trace, warn};
 
-use crate::layout::LayoutType;
 use crate::state::{window_current_size, GrabMode, GrabState, State};
 
 const BTN_LEFT: u32 = 0x110;

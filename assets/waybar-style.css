@@ -1,0 +1,170 @@
+/* ═══════════════════════════════════════════════════════════════
+   mywm — TokyoNight Waybar Theme
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Base bar ── */
+window#waybar {
+    background: transparent;
+    color: #c0caf5;
+    font-family: "JetBrainsMono Nerd Font", "Noto Sans CJK JP", monospace;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+window#waybar > box {
+    background-color: rgba(26, 27, 38, 0.92);
+    border: 1px solid rgba(122, 162, 247, 0.25);
+    border-radius: 15px;
+    margin: 0;
+    padding: 0 4px;
+}
+
+/* ── Tooltip ── */
+tooltip {
+    background-color: #1a1b26;
+    border: 1px solid #7aa2f7;
+    border-radius: 10px;
+    color: #c0caf5;
+    padding: 8px 12px;
+}
+
+tooltip label {
+    color: #c0caf5;
+    font-size: 12px;
+}
+
+/* ── Module defaults ── */
+#custom-logo,
+#custom-workspaces,
+#custom-layout,
+#clock,
+#pulseaudio,
+#network,
+#battery,
+#custom-power {
+    padding: 0 14px;
+    margin: 4px 3px;
+    border-radius: 12px;
+    background: transparent;
+    transition: all 200ms ease;
+}
+
+/* ── Hover glow on all modules ── */
+#custom-logo:hover,
+#custom-workspaces:hover,
+#custom-layout:hover,
+#clock:hover,
+#pulseaudio:hover,
+#network:hover,
+#battery:hover,
+#custom-power:hover {
+    background-color: rgba(122, 162, 247, 0.12);
+}
+
+/* ── Logo (left pill) ── */
+#custom-logo {
+    color: #7aa2f7;
+    font-size: 16px;
+    padding: 0 10px;
+    margin-left: 2px;
+    background-color: rgba(122, 162, 247, 0.08);
+    border-radius: 12px;
+}
+
+/* ── Workspaces ── */
+#custom-workspaces {
+    padding: 0 6px;
+    font-size: 14px;
+    letter-spacing: 2px;
+}
+
+#custom-workspaces.active {
+    background-color: rgba(122, 162, 247, 0.08);
+}
+
+/* ── Layout indicator ── */
+#custom-layout {
+    color: #bb9af7;
+    font-size: 11px;
+    font-style: italic;
+    padding: 0 10px;
+    opacity: 0.8;
+}
+
+/* ── Clock (center) ── */
+#clock {
+    color: #7aa2f7;
+    font-weight: 700;
+    font-size: 13px;
+    background-color: rgba(122, 162, 247, 0.06);
+    border-radius: 12px;
+    padding: 0 18px;
+}
+
+/* ── Pulseaudio ── */
+#pulseaudio {
+    color: #9ece6a;
+}
+
+#pulseaudio.muted {
+    color: #565f89;
+}
+
+/* ── Network ── */
+#network {
+    color: #7dcfff;
+}
+
+#network.disconnected {
+    color: #f7768e;
+}
+
+/* ── Battery ── */
+#battery {
+    color: #e0af68;
+}
+
+#battery.good {
+    color: #9ece6a;
+}
+
+#battery.warning {
+    color: #e0af68;
+}
+
+#battery.critical {
+    color: #f7768e;
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+#battery.charging,
+#battery.plugged {
+    color: #9ece6a;
+}
+
+@keyframes pulse {
+    from { opacity: 1; }
+    to   { opacity: 0.5; }
+}
+
+/* ── Power button (right pill) ── */
+#custom-power {
+    color: #f7768e;
+    font-size: 15px;
+    padding: 0 10px;
+    margin-right: 2px;
+    border-radius: 12px;
+}
+
+#custom-power:hover {
+    background-color: rgba(247, 118, 142, 0.15);
+    color: #ff9e9e;
+}
+
+/* ── Right module separators ── */
+#pulseaudio,
+#network {
+    border-right: 1px solid rgba(65, 72, 104, 0.4);
+    padding-right: 16px;
+    margin-right: 0;
+}

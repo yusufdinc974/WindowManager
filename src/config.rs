@@ -473,10 +473,6 @@ fn toml_path() -> Option<PathBuf> {
 const DEFAULT_RC_LUA: &str = r##"-- ============================================================
 --  mywm — default rc.lua
 --  ~/.config/mywm/rc.lua
---
---  This file runs AFTER config.toml is loaded. Values set here
---  override config.toml values. Use config.toml for simple
---  settings and rc.lua for dynamic behavior (themes, navbar).
 -- ============================================================
 
 local w = wm
@@ -509,21 +505,23 @@ w.__navbar_visible  = true
 
 function toggle_navbar()
     if w.__navbar_visible then
-        os.execute("pkill waybar 2>/dev/null")
+        os.execute("pkill -x waybar 2>/dev/null")
         w.__navbar_visible = false
         print("navbar -> hidden")
     else
         w.__navbar_position = (w.__navbar_position == "top")
                               and "bottom" or "top"
-        os.execute("pkill waybar 2>/dev/null; (waybar >/dev/null 2>&1 &)")
+        os.execute("pkill -x waybar 2>/dev/null; sleep 0.2; setsid waybar &")
         w.__navbar_visible = true
         print("navbar -> " .. w.__navbar_position)
     end
 end
 
+
+
 -- ── Autostart ──
 w.autostart = {
-    "pkill waybar 2>/dev/null; waybar >/dev/null 2>&1 &",
+    "setsid waybar &",
 }
 
 print(string.format(
