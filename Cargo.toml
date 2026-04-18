@@ -20,6 +20,8 @@ smithay = { git = "https://github.com/Smithay/smithay", default-features = false
     
 ] }
 
+toml = "0.8"
+
 libc = "0.2"
 
 tracing = "0.1"

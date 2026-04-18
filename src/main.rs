@@ -81,7 +81,7 @@ mod state;
 use config::Config;
 use input::{handle_ipc_command, handle_libinput_event, IpcCommand};
 use state::{
-    CalloopData, ClientState, DrmBackend, State, Workspace, CLEAR_COLOR,
+    CalloopData, ClientState, DrmBackend, State, Workspace, DEFAULT_CLEAR_COLOR,
 };
 
 // -------------------------------------------------------------------------
@@ -928,8 +928,8 @@ fn render_frame(data: &mut CalloopData) {
     let border_width = state.config.border_width.max(0);
     let focused_surface = state.keyboard.current_focus();
 
-    let active_color = parse_hex_color(&state.config.active_border_color);
-    let inactive_color = parse_hex_color(&state.config.inactive_border_color);
+    let active_color = crate::config::parse_hex_color(&state.config.active_border_color);
+    let inactive_color = crate::config::parse_hex_color(&state.config.inactive_border_color);
 
     let mut border_elements: Vec<OutputRenderElements> = Vec::new();
 
@@ -1034,7 +1034,7 @@ fn render_frame(data: &mut CalloopData) {
     match backend.compositor.render_frame::<_, _>(
         &mut state.renderer,
         &wrapped,
-        Color32F::from(CLEAR_COLOR),
+        Color32F::from(state.config.clear_color_f32()),
         FrameFlags::DEFAULT,
     ) {
         Ok(frame) => {

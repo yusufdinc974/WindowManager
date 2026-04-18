@@ -1,44 +1,80 @@
-//! Lua-driven runtime configuration.
+//! Dual-format runtime configuration: TOML (simple) + Lua (advanced).
 //!
-//! Phase 13 introduced an embedded Lua 5.4 interpreter (via `mlua`); Phase 14
-//! keeps the interpreter alive for the whole session so the user's rc.lua
-//! can define callbacks (`cycle_theme`, `toggle_navbar`) that the
-//! compositor invokes when keys are pressed.
+//! Load order:
+//!   1. Built-in defaults
+//!   2. If `~/.config/mywm/config.toml` exists → load TOML overrides
+//!   3. If `~/.config/mywm/rc.lua` exists → run Lua (can override TOML)
+//!   4. Any missing field keeps its default
 //!
-//! Startup sequence:
-//!
-//!  1. spin up a Lua VM with the full stdlib (including `os`/`io`, needed
-//!     by `toggle_navbar`'s shell-out),
-//!  2. seed a global `wm` table with the built-in defaults,
-//!  3. execute the user's `rc.lua`,
-//!  4. read `wm.*` back out into our strongly-typed [`Config`].
-//!
-//! Any failure at any stage — missing file, IO error, Lua syntax error,
-//! runtime error, type mismatch — downgrades gracefully to the built-in
-//! defaults so the compositor always boots.
+//! The Lua VM stays alive for the session so callbacks (cycle_theme,
+//! toggle_navbar) remain callable from keybinds.
 
 use std::{
+    collections::HashMap,
     fs,
     path::PathBuf,
 };
 
 use mlua::{Lua, Table, Value};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+// -------------------------------------------------------------------------
+// Keybinding types
+// -------------------------------------------------------------------------
+
+/// A modifier set for keybindings.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Modifiers {
+    #[serde(default)]
+    pub logo: bool,
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub alt: bool,
+}
+
+impl Default for Modifiers {
+    fn default() -> Self {
+        Self { logo: true, shift: false, ctrl: false, alt: false }
+    }
+}
+
+/// A single keybinding definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keybind {
+    pub modifiers: Modifiers,
+    pub key: String,
+    pub action: String,
+}
 
 // -------------------------------------------------------------------------
 // Config
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
+    // ── Programs ──
     pub terminal: String,
     pub launcher: String,
+
+    // ── Appearance ──
     pub outer_gaps: i32,
     pub inner_gaps: i32,
     pub border_width: i32,
     pub active_border_color: String,
     pub inactive_border_color: String,
+    pub clear_color: String,
+
+    // ── Workspaces ──
     pub workspace_names: Vec<String>,
+
+    // ── Keybindings ──
+    #[serde(default = "default_keybinds")]
+    pub keybinds: Vec<Keybind>,
 }
 
 impl Default for Config {
@@ -51,116 +87,283 @@ impl Default for Config {
             border_width: 2,
             active_border_color: "#7aa2f7".to_string(),
             inactive_border_color: "#1a1b26".to_string(),
+            clear_color: "#14101e".to_string(),
             workspace_names: vec![
                 "1".into(), "2".into(), "3".into(),
                 "4".into(), "5".into(), "6".into(),
                 "7".into(), "8".into(), "9".into(),
             ],
+            keybinds: default_keybinds(),
         }
     }
 }
 
+fn default_keybinds() -> Vec<Keybind> {
+    let super_only = Modifiers { logo: true, shift: false, ctrl: false, alt: false };
+    let super_shift = Modifiers { logo: true, shift: true, ctrl: false, alt: false };
+
+    vec![
+        Keybind { modifiers: super_shift.clone(), key: "Escape".into(), action: "quit".into() },
+        Keybind { modifiers: super_shift.clone(), key: "r".into(), action: "reload_config".into() },
+        Keybind { modifiers: super_only.clone(), key: "Return".into(), action: "spawn_terminal".into() },
+        Keybind { modifiers: super_only.clone(), key: "d".into(), action: "spawn_launcher".into() },
+        Keybind { modifiers: super_only.clone(), key: "q".into(), action: "close_focused".into() },
+        Keybind { modifiers: super_only.clone(), key: "f".into(), action: "toggle_fullscreen".into() },
+        Keybind { modifiers: super_only.clone(), key: "space".into(), action: "cycle_layout".into() },
+        Keybind { modifiers: super_shift.clone(), key: "space".into(), action: "toggle_floating".into() },
+        Keybind { modifiers: super_only.clone(), key: "t".into(), action: "cycle_theme".into() },
+        Keybind { modifiers: super_only.clone(), key: "b".into(), action: "toggle_navbar".into() },
+        Keybind { modifiers: super_only.clone(), key: "Left".into(), action: "focus_left".into() },
+        Keybind { modifiers: super_only.clone(), key: "Right".into(), action: "focus_right".into() },
+        Keybind { modifiers: super_shift.clone(), key: "Left".into(), action: "move_window_left".into() },
+        Keybind { modifiers: super_shift.clone(), key: "Right".into(), action: "move_window_right".into() },
+        // Workspace switching: Super+1..9
+        Keybind { modifiers: super_only.clone(), key: "1".into(), action: "workspace_1".into() },
+        Keybind { modifiers: super_only.clone(), key: "2".into(), action: "workspace_2".into() },
+        Keybind { modifiers: super_only.clone(), key: "3".into(), action: "workspace_3".into() },
+        Keybind { modifiers: super_only.clone(), key: "4".into(), action: "workspace_4".into() },
+        Keybind { modifiers: super_only.clone(), key: "5".into(), action: "workspace_5".into() },
+        Keybind { modifiers: super_only.clone(), key: "6".into(), action: "workspace_6".into() },
+        Keybind { modifiers: super_only.clone(), key: "7".into(), action: "workspace_7".into() },
+        Keybind { modifiers: super_only.clone(), key: "8".into(), action: "workspace_8".into() },
+        Keybind { modifiers: super_only.clone(), key: "9".into(), action: "workspace_9".into() },
+        // Move to workspace: Super+Shift+1..9
+        Keybind { modifiers: super_shift.clone(), key: "1".into(), action: "move_to_workspace_1".into() },
+        Keybind { modifiers: super_shift.clone(), key: "2".into(), action: "move_to_workspace_2".into() },
+        Keybind { modifiers: super_shift.clone(), key: "3".into(), action: "move_to_workspace_3".into() },
+        Keybind { modifiers: super_shift.clone(), key: "4".into(), action: "move_to_workspace_4".into() },
+        Keybind { modifiers: super_shift.clone(), key: "5".into(), action: "move_to_workspace_5".into() },
+        Keybind { modifiers: super_shift.clone(), key: "6".into(), action: "move_to_workspace_6".into() },
+        Keybind { modifiers: super_shift.clone(), key: "7".into(), action: "move_to_workspace_7".into() },
+        Keybind { modifiers: super_shift.clone(), key: "8".into(), action: "move_to_workspace_8".into() },
+        Keybind { modifiers: super_shift.clone(), key: "9".into(), action: "move_to_workspace_9".into() },
+    ]
+}
+
 impl Config {
-    /// Number of workspaces — derived from `workspace_names` so the name
-    /// list is the single source of truth.
     pub fn workspace_count(&self) -> usize {
         self.workspace_names.len()
     }
 
-    /// Boot the Lua VM, run `rc.lua`, and return the live VM alongside
-    /// the parsed configuration. The VM is kept alive for the whole
-    /// session so callbacks like `cycle_theme()` can be invoked later.
-    ///
-    /// On any failure we still return a live VM (possibly with only the
-    /// defaults seeded) plus a default [`Config`] so the compositor boots.
-    pub fn load_from_lua() -> (Lua, Self) {
-        // SAFETY: we use the *unsafe* constructor because our default
-        // rc.lua calls `os.execute("pkill waybar; waybar &")`, and the
-        // "safe" stdlib subset strips `os.execute`. The user's rc.lua is
-        // already trusted code (we run it in-process), so giving it the
-        // full stdlib is the right call.
-        let lua = unsafe { Lua::unsafe_new() };
-        let defaults = Self::default();
-
-        if let Err(err) = seed_wm_table(&lua, &defaults) {
-            warn!(?err, "config: failed to seed `wm` table, using defaults");
-            return (lua, defaults);
-        }
-
-        let Some(path) = rc_path() else {
-            warn!("config: could not resolve config directory, using defaults");
-            return (lua, defaults);
-        };
-
-        // First run: drop the default rc.lua on disk.
-        if !path.exists() {
-            if let Some(dir) = path.parent() {
-                if let Err(err) = fs::create_dir_all(dir) {
-                    warn!(?dir, ?err, "config: failed to create directory");
-                    return (lua, defaults);
-                }
-            }
-            if let Err(err) = fs::write(&path, DEFAULT_RC_LUA) {
-                warn!(?path, ?err, "config: failed to write default rc.lua");
-                return (lua, defaults);
-            }
-            info!(?path, "config: wrote default rc.lua");
-        }
-
-        let source = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(?path, ?err, "config: failed to read rc.lua, using defaults");
-                return (lua, defaults);
-            }
-        };
-
-        if let Err(err) = lua.load(&source).set_name("rc.lua").exec() {
-            warn!(?path, error = %err, "config: rc.lua failed, using defaults");
-            return (lua, defaults);
-        }
-        info!(?path, "config: rc.lua loaded");
-
-        let cfg = read_config_from_lua(&lua).unwrap_or_else(|err| {
-            warn!(?err, "config: could not read back wm table, using defaults");
-            Self::default()
-        });
-
-        (lua, cfg)
+    /// Parse clear_color into [f32; 4].
+    pub fn clear_color_f32(&self) -> [f32; 4] {
+        parse_hex_color(&self.clear_color)
     }
 
-    /// Re-read `wm.*` out of a live Lua VM. Used after `cycle_theme()` /
-    /// `toggle_navbar()` have mutated the table.
+    /// Load configuration: TOML first, then Lua on top.
+    /// Returns the live Lua VM + parsed config.
+    pub fn load_from_lua() -> (Lua, Self) {
+        // Step 1: Start with defaults
+        let mut config = Self::default();
+
+        // Step 2: Try loading TOML
+        if let Some(toml_path) = toml_path() {
+            if toml_path.exists() {
+                match fs::read_to_string(&toml_path) {
+                    Ok(contents) => match toml::from_str::<Config>(&contents) {
+                        Ok(toml_config) => {
+                            info!(?toml_path, "config: loaded config.toml");
+                            config = toml_config;
+                        }
+                        Err(err) => {
+                            warn!(?toml_path, %err, "config: config.toml parse error, using defaults");
+                        }
+                    },
+                    Err(err) => {
+                        warn!(?toml_path, ?err, "config: failed to read config.toml");
+                    }
+                }
+            } else {
+                // Write a default config.toml on first boot
+                if let Some(dir) = toml_path.parent() {
+                    let _ = fs::create_dir_all(dir);
+                }
+                match toml::to_string_pretty(&config) {
+                    Ok(toml_str) => {
+                        if let Err(err) = fs::write(&toml_path, &toml_str) {
+                            warn!(?toml_path, ?err, "config: failed to write default config.toml");
+                        } else {
+                            info!(?toml_path, "config: wrote default config.toml");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(%err, "config: failed to serialize default config to TOML");
+                    }
+                }
+            }
+        }
+
+        // Step 3: Lua VM (always created — needed for callbacks)
+        let lua = unsafe { Lua::unsafe_new() };
+
+        if let Err(err) = seed_wm_table(&lua, &config) {
+            warn!(?err, "config: failed to seed `wm` table");
+            return (lua, config);
+        }
+
+        // Step 4: Try loading rc.lua
+        if let Some(path) = rc_path() {
+            if !path.exists() {
+                if let Some(dir) = path.parent() {
+                    let _ = fs::create_dir_all(dir);
+                }
+                if let Err(err) = fs::write(&path, DEFAULT_RC_LUA) {
+                    warn!(?path, ?err, "config: failed to write default rc.lua");
+                } else {
+                    info!(?path, "config: wrote default rc.lua");
+                }
+            }
+
+            if path.exists() {
+                match fs::read_to_string(&path) {
+                    Ok(source) => {
+                        if let Err(err) = lua.load(&source).set_name("rc.lua").exec() {
+                            warn!(?path, error = %err, "config: rc.lua failed");
+                        } else {
+                            info!(?path, "config: rc.lua loaded");
+                            // Read back any Lua overrides
+                            match read_config_from_lua(&lua) {
+                                Ok(lua_config) => config = lua_config,
+                                Err(err) => {
+                                    warn!(?err, "config: could not read back wm table");
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(?path, ?err, "config: failed to read rc.lua");
+                    }
+                }
+            }
+        }
+
+        (lua, config)
+    }
+
+    /// Re-read `wm.*` out of a live Lua VM.
     pub fn refresh_from_lua(&mut self, lua: &Lua) {
         match read_config_from_lua(lua) {
             Ok(new) => *self = new,
             Err(err) => warn!(?err, "config: refresh from Lua failed"),
         }
     }
+
+    /// Reload both TOML and Lua from disk.
+    pub fn reload(&mut self, lua: &Lua) {
+        // Re-read TOML
+        if let Some(toml_path) = toml_path() {
+            if toml_path.exists() {
+                match fs::read_to_string(&toml_path) {
+                    Ok(contents) => match toml::from_str::<Config>(&contents) {
+                        Ok(toml_config) => {
+                            info!(?toml_path, "config: reloaded config.toml");
+                            *self = toml_config;
+                        }
+                        Err(err) => {
+                            warn!(?toml_path, %err, "config: reload config.toml parse error");
+                        }
+                    },
+                    Err(err) => {
+                        warn!(?toml_path, ?err, "config: reload failed to read config.toml");
+                    }
+                }
+            }
+        }
+
+        // Re-seed Lua with current config, then re-run rc.lua
+        if let Err(err) = seed_wm_table(lua, self) {
+            warn!(?err, "config: reload failed to seed wm table");
+            return;
+        }
+
+        if let Some(path) = rc_path() {
+            if path.exists() {
+                match fs::read_to_string(&path) {
+                    Ok(source) => {
+                        if let Err(err) = lua.load(&source).set_name("rc.lua").exec() {
+                            warn!(?path, error = %err, "config: reload rc.lua failed");
+                        } else {
+                            info!(?path, "config: reloaded rc.lua");
+                            self.refresh_from_lua(lua);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(?path, ?err, "config: reload failed to read rc.lua");
+                    }
+                }
+            }
+        }
+
+        info!(
+            terminal = %self.terminal,
+            border = self.border_width,
+            active = %self.active_border_color,
+            inactive = %self.inactive_border_color,
+            gaps = ?(self.outer_gaps, self.inner_gaps),
+            workspaces = self.workspace_count(),
+            "config: reload complete"
+        );
+    }
+
+    /// Build a lookup table from (modifiers, key_name) → action string
+    /// for fast keybinding dispatch.
+    pub fn keybind_map(&self) -> HashMap<(bool, bool, bool, bool, String), String> {
+        let mut map = HashMap::new();
+        for kb in &self.keybinds {
+            let key = (
+                kb.modifiers.logo,
+                kb.modifiers.shift,
+                kb.modifiers.ctrl,
+                kb.modifiers.alt,
+                kb.key.to_lowercase(),
+            );
+            map.insert(key, kb.action.clone());
+        }
+        map
+    }
+}
+
+// -------------------------------------------------------------------------
+// Hex color parser (reusable)
+// -------------------------------------------------------------------------
+
+pub fn parse_hex_color(hex: &str) -> [f32; 4] {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() < 6 {
+        return [1.0, 1.0, 1.0, 1.0];
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255) as f32 / 255.0;
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(255) as f32 / 255.0;
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255) as f32 / 255.0;
+    let a = if hex.len() >= 8 {
+        u8::from_str_radix(&hex[6..8], 16).unwrap_or(255) as f32 / 255.0
+    } else {
+        1.0
+    };
+    [r, g, b, a]
 }
 
 // -------------------------------------------------------------------------
 // Lua plumbing
 // -------------------------------------------------------------------------
 
-fn seed_wm_table(lua: &Lua, defaults: &Config) -> mlua::Result<()> {
+fn seed_wm_table(lua: &Lua, config: &Config) -> mlua::Result<()> {
     let wm = lua.create_table()?;
-    wm.set("terminal", defaults.terminal.clone())?;
-    wm.set("launcher", defaults.launcher.clone())?;
-    wm.set("outer_gaps", defaults.outer_gaps)?;
-    wm.set("inner_gaps", defaults.inner_gaps)?;
-    wm.set("border_width", defaults.border_width)?;
-    wm.set("active_border_color", defaults.active_border_color.clone())?;
-    wm.set("inactive_border_color", defaults.inactive_border_color.clone())?;
+    wm.set("terminal", config.terminal.clone())?;
+    wm.set("launcher", config.launcher.clone())?;
+    wm.set("outer_gaps", config.outer_gaps)?;
+    wm.set("inner_gaps", config.inner_gaps)?;
+    wm.set("border_width", config.border_width)?;
+    wm.set("active_border_color", config.active_border_color.clone())?;
+    wm.set("inactive_border_color", config.inactive_border_color.clone())?;
+    wm.set("clear_color", config.clear_color.clone())?;
 
     let names = lua.create_table()?;
-    for (i, n) in defaults.workspace_names.iter().enumerate() {
-        // Lua tables are 1-indexed — keep that idiom visible to the user.
+    for (i, n) in config.workspace_names.iter().enumerate() {
         names.set(i + 1, n.clone())?;
     }
     wm.set("workspace_names", names)?;
 
-    // Seed an empty autostart table so rc.lua can append to it.
     let autostart = lua.create_table()?;
     wm.set("autostart", autostart)?;
 
@@ -186,6 +389,11 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
         &wm,
         "inactive_border_color",
         defaults.inactive_border_color.clone(),
+    );
+    let clear_color: String = get_or(
+        &wm,
+        "clear_color",
+        defaults.clear_color.clone(),
     );
 
     let workspace_names = match wm.get::<_, Value>("workspace_names") {
@@ -216,11 +424,12 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
         border_width,
         active_border_color,
         inactive_border_color,
-        workspace_names,    })
+        clear_color,
+        workspace_names,
+        keybinds: defaults.keybinds, // Keybinds stay from TOML/defaults (Lua doesn't override)
+    })
 }
 
-/// Pull a field out of a Lua table, swapping in `fallback` (with a warning)
-/// on any type / lookup error.
 fn get_or<V>(tbl: &Table, key: &str, fallback: V) -> V
 where
     V: for<'lua> mlua::FromLua<'lua> + Clone,
@@ -238,80 +447,41 @@ where
 // Paths
 // -------------------------------------------------------------------------
 
-fn rc_path() -> Option<PathBuf> {
+fn config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         let p = PathBuf::from(xdg);
         if !p.as_os_str().is_empty() {
-            return Some(p.join("mywm").join("rc.lua"));
+            return Some(p.join("mywm"));
         }
     }
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config").join("mywm").join("rc.lua"))
+    Some(PathBuf::from(home).join(".config").join("mywm"))
+}
+
+fn rc_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("rc.lua"))
+}
+
+fn toml_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("config.toml"))
 }
 
 // -------------------------------------------------------------------------
-// Default rc.lua (written on first boot)
+// Default rc.lua
 // -------------------------------------------------------------------------
 
 const DEFAULT_RC_LUA: &str = r##"-- ============================================================
 --  mywm — default rc.lua
 --  ~/.config/mywm/rc.lua
 --
---  This file is plain Lua 5.4. It runs once, inside the
---  compositor, at startup. The `wm` table is pre-populated
---  with built-in defaults before this script runs — mutate it
---  and the compositor reads your changes back.
---
---  Functions you define as globals (cycle_theme, toggle_navbar)
---  can be invoked from keybinds; the Rust side calls them by
---  name whenever you press the associated key chord.
---
---  NOTE: Do NOT use os.execute() to launch Wayland clients
---  (waybar, terminals, etc.) directly in this file. When
---  rc.lua runs, the Wayland socket does not exist yet.
---  Instead, add commands to `wm.autostart` — the compositor
---  will spawn them after the socket is live.
+--  This file runs AFTER config.toml is loaded. Values set here
+--  override config.toml values. Use config.toml for simple
+--  settings and rc.lua for dynamic behavior (themes, navbar).
 -- ============================================================
 
--- ------------------------------------------------------------
---  1.  Shortcut
--- ------------------------------------------------------------
 local w = wm
 
--- ------------------------------------------------------------
---  2.  Terminal
--- ------------------------------------------------------------
-w.terminal = "alacritty"
-
--- Application launcher. Spawned on Super+D via `sh -c`, so any
--- arguments you pass here are parsed by the shell as usual.
--- `fuzzel` is recommended — it is a native wlr-layer-shell launcher
--- with no GTK3 dependency. `wofi --show drun` also works but its
--- GTK3 seat initialisation is fragile on non-GNOME compositors.
-w.launcher = "fuzzel"
-
--- ------------------------------------------------------------
---  3.  Gaps & borders
--- ------------------------------------------------------------
-w.outer_gaps   = 15
-w.inner_gaps   = 10
-w.border_width = 2
-
--- ------------------------------------------------------------
---  4.  Workspaces
--- ------------------------------------------------------------
-w.workspace_names = {
-    "1:web", "2:code", "3:term", "4:chat", "5:media",
-    "6", "7", "8", "9:scratch",
-}
-
--- ------------------------------------------------------------
---  5.  Theme palette
---
---      Each entry has `name`, `active` (border on the focused
---      window) and `inactive` (everything else). Add or remove
---      freely — the cycle function below just walks the list.
--- ------------------------------------------------------------
+-- ── Theme palette ──
 local themes = {
     { name = "tokyonight", active = "#7aa2f7", inactive = "#1a1b26" },
     { name = "gruvbox",    active = "#fabd2f", inactive = "#3c3836" },
@@ -320,14 +490,10 @@ local themes = {
     { name = "nord",       active = "#88c0d0", inactive = "#2e3440" },
 }
 
--- Internal state for the cycler — prefixed with `__` to
--- signal "Rust doesn't read this".
 w.__theme_index = 1
 w.active_border_color   = themes[1].active
 w.inactive_border_color = themes[1].inactive
 
--- Invoked from Rust when Super+T is pressed. Must be a global
--- function (not `local`) so the compositor can resolve it.
 function cycle_theme()
     w.__theme_index = (w.__theme_index % #themes) + 1
     local t = themes[w.__theme_index]
@@ -337,28 +503,9 @@ function cycle_theme()
           t.name, t.active, t.inactive))
 end
 
--- ------------------------------------------------------------
---  6.  Navbar (Waybar) placement
---
---      `toggle_navbar` regenerates ~/.config/waybar/config
---      with the opposite `position` value, then restarts
---      waybar so the change takes effect. Invoked from
---      Super+B.
--- ------------------------------------------------------------
+-- ── Navbar toggle ──
 w.__navbar_position = "top"
 w.__navbar_visible  = true
-
-local function waybar_config_text(position)
-    return string.format([[{
-  "position": "%s",
-  "height": 30,
-  "spacing": 6,
-  "modules-left":   ["sway/workspaces"],
-  "modules-center": ["clock"],
-  "modules-right":  ["pulseaudio", "battery", "tray"]
-}
-]], position)
-end
 
 function toggle_navbar()
     if w.__navbar_visible then
@@ -368,37 +515,17 @@ function toggle_navbar()
     else
         w.__navbar_position = (w.__navbar_position == "top")
                               and "bottom" or "top"
-        local home = os.getenv("HOME") or ""
-        local dir  = home .. "/.config/waybar"
-        os.execute("mkdir -p '" .. dir .. "'")
-        local path = dir .. "/config"
-        local f, err = io.open(path, "w")
-        if f == nil then
-            print("toggle_navbar: open " .. path .. " failed: " .. (err or "?"))
-            return
-        end
-        f:write(waybar_config_text(w.__navbar_position))
-        f:close()
         os.execute("pkill waybar 2>/dev/null; (waybar >/dev/null 2>&1 &)")
         w.__navbar_visible = true
         print("navbar -> " .. w.__navbar_position)
     end
 end
 
--- ------------------------------------------------------------
---  7.  Autostart
---
---      Commands listed here are spawned by the compositor
---      AFTER the Wayland socket is live. Do NOT use
---      os.execute() for Wayland clients in this file.
--- ------------------------------------------------------------
+-- ── Autostart ──
 w.autostart = {
     "pkill waybar 2>/dev/null; waybar >/dev/null 2>&1 &",
 }
 
--- ------------------------------------------------------------
---  8.  Startup summary
--- ------------------------------------------------------------
 print(string.format(
     "rc.lua: %d workspaces, gaps %d/%d, border %dpx %s",
     #w.workspace_names,

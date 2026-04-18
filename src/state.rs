@@ -48,7 +48,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::layout::LayoutType;
 
-pub const CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
+pub const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
 pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
 pub const ANIMATION_START_SCALE: f32 = 0.8;
 
@@ -271,6 +271,23 @@ pub struct CalloopData {
 // -------------------------------------------------------------------------
 
 impl State {
+     /// Hot-reload config from disk (TOML + Lua).
+    pub fn reload_config(&mut self) {
+        info!("reloading configuration from disk");
+        self.config.reload(&self.lua);
+
+        // Re-tile everything with new gaps/borders
+        let output = self.output.clone();
+        let outer = self.config.outer_gaps;
+        let inner = self.config.inner_gaps;
+        let border = self.config.border_width;
+        let focused = self.keyboard.current_focus();
+        for ws in self.workspaces.iter_mut() {
+            Self::recalculate_layout_for(ws, &output, outer, inner, border, focused.as_ref());
+        }
+        self.needs_redraw = true;
+    }
+
     /// Returns true if a layer surface currently holds keyboard focus.
     pub fn layer_has_keyboard_focus(&self) -> bool {
         let Some(focused) = self.keyboard.current_focus() else {

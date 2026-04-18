@@ -83,13 +83,71 @@ fn keysym_to_workspace_index(sym: Keysym) -> Option<usize> {
     }
 }
 
+fn keysym_to_key_name(sym: Keysym) -> Option<String> {
+    match sym {
+        Keysym::Return => Some("return".into()),
+        Keysym::Escape => Some("escape".into()),
+        Keysym::space  => Some("space".into()),
+        Keysym::Left   => Some("left".into()),
+        Keysym::Right  => Some("right".into()),
+        Keysym::Up     => Some("up".into()),
+        Keysym::Down   => Some("down".into()),
+        Keysym::_1     => Some("1".into()),
+        Keysym::_2     => Some("2".into()),
+        Keysym::_3     => Some("3".into()),
+        Keysym::_4     => Some("4".into()),
+        Keysym::_5     => Some("5".into()),
+        Keysym::_6     => Some("6".into()),
+        Keysym::_7     => Some("7".into()),
+        Keysym::_8     => Some("8".into()),
+        Keysym::_9     => Some("9".into()),
+        _ => {
+            // For letter keys, get the lowercase character name
+            let raw = sym.key_char();
+            raw.map(|c| c.to_lowercase().to_string())
+        }
+    }
+}
+
+fn action_string_to_key_action(action: &str) -> Option<KeyAction> {
+    match action {
+        "quit" => Some(KeyAction::Quit),
+        "reload_config" => Some(KeyAction::ReloadConfig),
+        "spawn_terminal" => Some(KeyAction::SpawnTerminal),
+        "spawn_launcher" => Some(KeyAction::SpawnLauncher),
+        "close_focused" => Some(KeyAction::CloseFocused),
+        "toggle_fullscreen" => Some(KeyAction::ToggleFullscreen),
+        "cycle_layout" => Some(KeyAction::CycleLayout),
+        "toggle_floating" => Some(KeyAction::ToggleFloating),
+        "focus_left" => Some(KeyAction::FocusLeft),
+        "focus_right" => Some(KeyAction::FocusRight),
+        "move_window_left" => Some(KeyAction::MoveWindowLeft),
+        "move_window_right" => Some(KeyAction::MoveWindowRight),
+        "cycle_theme" => Some(KeyAction::CycleTheme),
+        "toggle_navbar" => Some(KeyAction::ToggleNavbar),
+        s if s.starts_with("workspace_") => {
+            s.strip_prefix("workspace_")
+                .and_then(|n| n.parse::<usize>().ok())
+                .map(|n| KeyAction::SwitchWorkspace(n.saturating_sub(1)))
+        }
+        s if s.starts_with("move_to_workspace_") => {
+            s.strip_prefix("move_to_workspace_")
+                .and_then(|n| n.parse::<usize>().ok())
+                .map(|n| KeyAction::MoveToWorkspace(n.saturating_sub(1)))
+        }
+        _ => {
+            warn!(action, "unknown keybind action");
+            None
+        }
+    }
+}
+
 fn handle_keybinding(
     state: &mut State,
     mods: &ModifiersState,
     keysym_handle: KeysymHandle<'_>,
     key_state: KeyState,
 ) -> FilterResult<KeyAction> {
-    // Always forward key releases — clients need them.
     if key_state != KeyState::Pressed {
         return FilterResult::Forward;
     }
@@ -97,13 +155,8 @@ fn handle_keybinding(
     let sym = keysym_handle.modified_sym();
     let on_layer = state.layer_has_keyboard_focus();
 
-    // Plain Escape with focus on a layer surface: dismiss it.
-    if sym == Keysym::Escape
-        && !mods.logo
-        && !mods.ctrl
-        && !mods.alt
-        && !mods.shift
-    {
+    // Escape on layer surface → dismiss
+    if sym == Keysym::Escape && !mods.logo && !mods.ctrl && !mods.alt && !mods.shift {
         if on_layer {
             if let Some(focused) = state.keyboard.current_focus() {
                 if let Some(layer) = state.layer_surface_of(&focused) {
@@ -118,59 +171,49 @@ fn handle_keybinding(
         return FilterResult::Forward;
     }
 
-    // If Super is NOT held, forward to the focused client unconditionally.
+    // Build the lookup key from current modifier state + key name.
+    // Try modified sym first, then raw sym for shifted keys (e.g., Shift+1).
+    let key_name = keysym_to_key_name(sym);
+    let raw_key_name = keysym_handle
+        .raw_syms()
+        .first()
+        .and_then(|s| keysym_to_key_name(*s));
+
+    let lookup_key = (mods.logo, mods.shift, mods.ctrl, mods.alt);
+
+    let keybind_map = state.config.keybind_map();
+
+    // Try modified sym name first
+    let action_str = key_name
+        .as_ref()
+        .and_then(|name| {
+            keybind_map.get(&(lookup_key.0, lookup_key.1, lookup_key.2, lookup_key.3, name.clone()))
+        })
+        .or_else(|| {
+            // Fallback to raw sym (handles Shift+1 where modified sym is '!')
+            raw_key_name.as_ref().and_then(|name| {
+                keybind_map.get(&(lookup_key.0, lookup_key.1, lookup_key.2, lookup_key.3, name.clone()))
+            })
+        });
+
+    if let Some(action_str) = action_str {
+        debug!(
+            action = %action_str,
+            key = ?key_name,
+            "keybind matched"
+        );
+        if let Some(action) = action_string_to_key_action(action_str) {
+            return FilterResult::Intercept(action);
+        }
+    }
+
+    // No keybind matched — forward to client if no Super,
+    // or swallow if Super is held (prevents random chars in terminals).
     if !mods.logo {
-        return FilterResult::Forward;
-    }
-
-    // Super IS held. If focus is on a layer surface, only handle
-    // compositor-level bindings — forward everything else so the
-    // layer client can use Super+<key> combos if it wants.
-    if mods.ctrl || mods.alt {
-        return FilterResult::Forward;
-    }
-
-    let action = if mods.shift {
-        debug!(?mods, sym = ?sym, "chord pressed (Super+Shift)");
-        match sym {
-            Keysym::Escape                          => KeyAction::Quit,
-            s if s == Keysym::r || s == Keysym::R   => KeyAction::ReloadConfig,
-            Keysym::Left                             => KeyAction::MoveWindowLeft,
-            Keysym::Right                            => KeyAction::MoveWindowRight,
-            Keysym::space                            => KeyAction::ToggleFloating,
-            _ => {
-                let raw_sym = keysym_handle.raw_syms().first().copied()
-                    .unwrap_or(sym);
-                if let Some(idx) = keysym_to_workspace_index(raw_sym) {
-                    KeyAction::MoveToWorkspace(idx)
-                } else {
-                    return FilterResult::Forward;
-                }
-            }
-        }
+        FilterResult::Forward
     } else {
-        debug!(?mods, sym = ?sym, "chord pressed (Super)");
-        match sym {
-            Keysym::Return                           => KeyAction::SpawnTerminal,
-            s if s == Keysym::d || s == Keysym::D    => KeyAction::SpawnLauncher,
-            s if s == Keysym::q || s == Keysym::Q    => KeyAction::CloseFocused,
-            s if s == Keysym::f || s == Keysym::F    => KeyAction::ToggleFullscreen,
-            s if s == Keysym::t || s == Keysym::T    => KeyAction::CycleTheme,
-            s if s == Keysym::b || s == Keysym::B    => KeyAction::ToggleNavbar,
-            Keysym::space                            => KeyAction::CycleLayout,
-            Keysym::Left                             => KeyAction::FocusLeft,
-            Keysym::Right                            => KeyAction::FocusRight,
-            _ => {
-                if let Some(idx) = keysym_to_workspace_index(sym) {
-                    KeyAction::SwitchWorkspace(idx)
-                } else {
-                    return FilterResult::Forward;
-                }
-            }
-        }
-    };
-
-    FilterResult::Intercept(action)
+        FilterResult::Forward // Forward even with Super so clients can use it
+    }
 }
 
 fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
@@ -178,7 +221,7 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
 
     match action {
         KeyAction::Quit => {
-            info!("kill switch triggered (Super+Shift+Escape) — stopping");
+            info!("kill switch triggered — stopping");
             state.loop_signal.stop();
         }
         KeyAction::SpawnTerminal => spawn_terminal(&state.config.terminal),
@@ -186,7 +229,8 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         KeyAction::FocusRight => state.focus_relative(1),
         KeyAction::FocusLeft => state.focus_relative(-1),
         KeyAction::ReloadConfig => {
-            info!("Action ReloadConfig not yet implemented");
+            info!("hot-reloading configuration");
+            state.reload_config();
         }
         KeyAction::SpawnLauncher => spawn_launcher(&state.config.launcher),
         KeyAction::ToggleFullscreen => {
