@@ -1,21 +1,22 @@
-//! Phase 7: Workspaces (Virtual Desktops).
+//! Phase 10: bare-metal Wayland compositor entry point.
+//!
+//! After the Grand Refactoring `main.rs` only hosts:
+//!   * module declarations,
+//!   * the DRM/udev/libseat backend bringup,
+//!   * `render_frame` / `handle_drm_event`,
+//!   * the `main()` function and its calloop event loop.
 
 use std::{
     collections::HashSet,
-    ffi::OsString,
     io::Read,
     os::unix::net::UnixListener,
-    process::Command,
     sync::Arc,
     time::Duration,
 };
 
-use serde::Deserialize;
-
 use smithay::{
     backend::{
         allocator::{
-            dmabuf::Dmabuf,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
             Fourcc,
         },
@@ -25,712 +26,65 @@ use smithay::{
             DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType,
         },
         egl::{EGLContext, EGLDisplay},
-        input::{
-            ButtonState, Event as _, InputEvent, KeyState, KeyboardKeyEvent,
-            PointerButtonEvent, PointerMotionEvent,
-        },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             element::surface::WaylandSurfaceRenderElement,
             gles::GlesRenderer,
-            utils::on_commit_buffer_handler,
             Color32F,
         },
-        session::{
-            libseat::LibSeatSession, Event as SessionEvent, Session,
-        },
+        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
         udev::{primary_gpu, UdevBackend},
     },
-    delegate_compositor, delegate_dmabuf, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         space::{space_render_elements, SpaceRenderElements},
         PopupManager, Space, Window, WindowSurfaceType,
     },
-    input::{
-        keyboard::{
-            FilterResult, KeyboardHandle, KeysymHandle, Keysym, ModifiersState, XkbConfig,
-        },
-        pointer::{CursorImageStatus, PointerHandle},
-        Seat, SeatHandler, SeatState,
-    },
+    input::{keyboard::XkbConfig, Seat, SeatState},
     output::{Mode as WlOutputMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
             generic::Generic,
-            EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction,
+            EventLoop, Interest, Mode as CalloopMode, PostAction,
             RegistrationToken,
         },
         drm::{
             self,
-            control::{connector, crtc, Device as _, ModeTypeFlags},
-        },
-        rustix::fs::OFlags,
-        wayland_protocols::xdg::{
-            decoration::zv1::server::zxdg_toplevel_decoration_v1,
-            shell::server::xdg_toplevel,
-        },
-        wayland_server::{
-            backend::{ClientData, ClientId, DisconnectReason},
-            protocol::{wl_buffer::WlBuffer, wl_seat::WlSeat, wl_surface::WlSurface},
-            Client, Display, DisplayHandle,
+            control::{connector, Device as _, ModeTypeFlags},
         },
         input::Libinput,
+        rustix::fs::OFlags,
+        wayland_server::{
+            protocol::wl_surface::WlSurface, Display, DisplayHandle,
+        },
     },
-    utils::{DeviceFd, Logical, Point, Serial, Transform, SERIAL_COUNTER},
+    utils::{DeviceFd, Logical, Point, Transform},
     wayland::{
-        buffer::BufferHandler,
-        compositor::{
-            get_parent, is_sync_subsurface, with_states, CompositorClientState,
-            CompositorHandler, CompositorState,
+        compositor::CompositorState,
+        dmabuf::{DmabufFeedbackBuilder, DmabufState},
+        output::OutputManagerState,
+        shell::{
+            wlr_layer::WlrLayerShellState,
+            xdg::{decoration::XdgDecorationState, XdgShellState},
         },
-        dmabuf::{
-            DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
-        },
-        output::{OutputHandler, OutputManagerState},
-        shell::xdg::{
-            decoration::{XdgDecorationHandler, XdgDecorationState},
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
-        },
-        shm::{ShmHandler, ShmState},
+        shm::ShmState,
         socket::ListeningSocketSource,
     },
 };
-use tracing::{debug, info, trace, warn};
-
-const CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
-const NUM_WORKSPACES: usize = 9;
+use tracing::{info, trace, warn};
 
 // -------------------------------------------------------------------------
-// Workspace
+// Extracted modules (Phase 10)
 // -------------------------------------------------------------------------
 
-pub struct Workspace {
-    pub space: Space<Window>,
-    pub windows: Vec<Window>,
-}
-
-impl Workspace {
-    pub fn new(output: &Output) -> Self {
-        let mut space = Space::default();
-        space.map_output(output, (0, 0));
-        Self {
-            space,
-            windows: Vec::new(),
-        }
-    }
-}
-
-// -------------------------------------------------------------------------
-// Compositor state
-// -------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-pub enum KeyAction {
-    Quit,
-    ReloadConfig,
-    SpawnTerminal,
-    SpawnLauncher,
-    CloseFocused,
-    ToggleFullscreen,
-    ToggleFloating,
-    FocusLeft,
-    FocusRight,
-    MoveWindowLeft,
-    MoveWindowRight,
-    SwitchWorkspace(usize),
-    MoveToWorkspace(usize),
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub enum IpcCommand {
-    Quit,
-    SpawnTerminal,
-    CloseFocused,
-}
-
-pub struct State {
-    pub start_time: std::time::Instant,
-    pub display_handle: DisplayHandle,
-    pub loop_signal: LoopSignal,
-    pub socket_name: OsString,
-
-    pub compositor_state: CompositorState,
-    pub xdg_shell_state: XdgShellState,
-    pub xdg_decoration_state: XdgDecorationState,
-    pub shm_state: ShmState,
-    pub output_manager_state: OutputManagerState,
-    pub seat_state: SeatState<Self>,
-    pub dmabuf_state: DmabufState,
-
-    pub seat: Seat<Self>,
-    pub keyboard: KeyboardHandle<Self>,
-    pub pointer: PointerHandle<Self>,
-    pub pointer_location: Point<f64, Logical>,
-
-    pub workspaces: Vec<Workspace>,
-    pub active_workspace: usize,
-    pub output: Output,
-    pub popups: PopupManager,
-
-    /// Set to true whenever the scene changes and a new frame should
-    /// be rendered.
-    pub needs_redraw: bool,
-}
-
-#[derive(Default)]
-pub struct ClientState {
-    pub compositor_state: CompositorClientState,
-}
-
-impl ClientData for ClientState {
-    fn initialized(&self, _client_id: ClientId) {}
-    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
-}
-
-pub struct CalloopData {
-    pub state: State,
-    pub backend: DrmBackend,
-}
-
-type WmDrmCompositor = DrmCompositor<
-    GbmAllocator<DrmDeviceFd>,
-    GbmFramebufferExporter<DrmDeviceFd>,
-    (),
-    DrmDeviceFd,
->;
-
-pub struct DrmBackend {
-    #[allow(dead_code)]
-    pub drm_node: DrmNode,
-    pub renderer: GlesRenderer,
-    pub compositor: WmDrmCompositor,
-    pub crtc: crtc::Handle,
-    pub frame_sent: HashSet<WlSurface>,
-    /// True when a frame has been queued but VBlank hasn't fired yet.
-    pub pending_frame: bool,
-}
-
-// -------------------------------------------------------------------------
-// SeatHandler
-// -------------------------------------------------------------------------
-
-impl SeatHandler for State {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
-    type TouchFocus = WlSurface;
-
-    fn seat_state(&mut self) -> &mut SeatState<Self> {
-        &mut self.seat_state
-    }
-
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
-}
-delegate_seat!(State);
-
-// -------------------------------------------------------------------------
-// CompositorHandler / ShmHandler / BufferHandler
-// -------------------------------------------------------------------------
-
-impl CompositorHandler for State {
-    fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor_state
-    }
-
-    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
-    }
-
-    fn commit(&mut self, surface: &WlSurface) {
-        on_commit_buffer_handler::<Self>(surface);
-
-        if !is_sync_subsurface(surface) {
-            let mut root = surface.clone();
-            while let Some(parent) = get_parent(&root) {
-                root = parent;
-            }
-
-            let ws = &self.workspaces[self.active_workspace];
-            if let Some(window) = ws
-                .space
-                .elements()
-                .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-            {
-                window.on_commit();
-            }
-        }
-
-        handle_initial_configure(surface, &self.workspaces[self.active_workspace].space);
-
-        // A client committed new content — we need to repaint.
-        self.needs_redraw = true;
-
-        if let Err(err) = self.display_handle.flush_clients() {
-            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                warn!(?err, "flush_clients failed in commit handler");
-            }
-        }
-    }
-}
-
-impl BufferHandler for State {
-    fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
-}
-
-impl ShmHandler for State {
-    fn shm_state(&self) -> &ShmState {
-        &self.shm_state
-    }
-}
-
-delegate_compositor!(State);
-delegate_shm!(State);
-
-// -------------------------------------------------------------------------
-// DmabufHandler
-// -------------------------------------------------------------------------
-
-impl DmabufHandler for State {
-    fn dmabuf_state(&mut self) -> &mut DmabufState {
-        &mut self.dmabuf_state
-    }
-
-    fn dmabuf_imported(
-        &mut self,
-        _global: &DmabufGlobal,
-        _dmabuf: Dmabuf,
-        notifier: ImportNotifier,
-    ) {
-        let _ = notifier.successful::<State>();
-    }
-}
-
-delegate_dmabuf!(State);
-
-// -------------------------------------------------------------------------
-// XdgShellHandler
-// -------------------------------------------------------------------------
-
-impl XdgShellHandler for State {
-    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.xdg_shell_state
-    }
-
-    fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        info!(
-            workspace = self.active_workspace + 1,
-            "new xdg toplevel on workspace"
-        );
-
-        let window = Window::new_wayland_window(surface);
-        let ws = &mut self.workspaces[self.active_workspace];
-        ws.windows.push(window.clone());
-        Self::recalculate_layout_for(ws, &self.output);
-
-        let wl_surface = window.toplevel().unwrap().wl_surface().clone();
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, Some(wl_surface), serial);
-
-        self.needs_redraw = true;
-
-        if let Err(err) = self.display_handle.flush_clients() {
-            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                warn!(?err, "flush_clients failed after new_toplevel");
-            }
-        }
-    }
-
-    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        info!("xdg toplevel destroyed");
-
-        let dying = surface.wl_surface().clone();
-
-        // Find which workspace owns this surface and clean it up.
-        for (i, ws) in self.workspaces.iter_mut().enumerate() {
-            let had_window = ws.windows.len();
-            ws.windows
-                .retain(|w| w.toplevel().map(|t| t.wl_surface()) != Some(&dying));
-
-            if ws.windows.len() != had_window {
-                let dead = ws
-                    .space
-                    .elements()
-                    .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&dying))
-                    .cloned();
-                if let Some(window) = dead {
-                    ws.space.unmap_elem(&window);
-                }
-                // We can't call Self::recalculate_layout_for here because
-                // we have a mutable borrow on self.workspaces via the
-                // iterator. We'll note the index and do it after.
-                info!(workspace = i + 1, "removed destroyed toplevel from workspace");
-                break;
-            }
-        }
-
-        // Recalculate layout for all workspaces that might have changed.
-        // In practice only one did, but this is cheap and correct.
-        for ws in self.workspaces.iter_mut() {
-            Self::recalculate_layout_for(ws, &self.output);
-        }
-
-        // Update keyboard focus to whatever is on top of the active workspace.
-        let focus = self.workspaces[self.active_workspace]
-            .windows
-            .first()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, focus, serial);
-
-        self.needs_redraw = true;
-
-        if let Err(err) = self.display_handle.flush_clients() {
-            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                warn!(?err, "flush_clients failed after toplevel_destroyed");
-            }
-        }
-    }
-
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        let _ = self.popups.track_popup(
-            smithay::desktop::PopupKind::Xdg(surface),
-        );
-    }
-
-    fn reposition_request(
-        &mut self,
-        surface: PopupSurface,
-        positioner: PositionerState,
-        token: u32,
-    ) {
-        surface.with_pending_state(|state| {
-            state.geometry = positioner.get_geometry();
-            state.positioner = positioner;
-        });
-        surface.send_repositioned(token);
-    }
-
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
-    fn move_request(&mut self, _surface: ToplevelSurface, _seat: WlSeat, _serial: Serial) {}
-
-    fn resize_request(
-        &mut self,
-        _surface: ToplevelSurface,
-        _seat: WlSeat,
-        _serial: Serial,
-        _edges: xdg_toplevel::ResizeEdge,
-    ) {
-    }
-}
-
-delegate_xdg_shell!(State);
-
-// -------------------------------------------------------------------------
-// XdgDecorationHandler
-// -------------------------------------------------------------------------
-
-impl XdgDecorationHandler for State {
-    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ServerSide);
-        });
-        toplevel.send_configure();
-    }
-
-    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: zxdg_toplevel_decoration_v1::Mode) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ServerSide);
-        });
-        toplevel.send_configure();
-    }
-
-    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ServerSide);
-        });
-        toplevel.send_configure();
-    }
-}
-
-delegate_xdg_decoration!(State);
-
-// -------------------------------------------------------------------------
-// Tiling layout & workspace operations
-// -------------------------------------------------------------------------
-
-impl State {
-    /// Static helper — operates on a single workspace so we can call it
-    /// without needing `&mut self` (avoids borrow-checker gymnastics).
-    pub fn recalculate_layout_for(ws: &mut Workspace, output: &Output) {
-        let Some(geo) = ws.space.output_geometry(output) else {
-            return;
-        };
-        let origin = geo.loc;
-        let (screen_w, screen_h) = (geo.size.w, geo.size.h);
-
-        match ws.windows.len() {
-            0 => {}
-            1 => {
-                place_tile(
-                    &mut ws.space,
-                    &ws.windows[0],
-                    origin,
-                    (screen_w, screen_h),
-                );
-            }
-            n => {
-                let master_w = screen_w / 2;
-                let stack_w = screen_w - master_w;
-                let stack_x = origin.x + master_w;
-                let stack_count = (n - 1) as i32;
-                let slice_h = screen_h / stack_count;
-
-                place_tile(
-                    &mut ws.space,
-                    &ws.windows[0],
-                    origin,
-                    (master_w, screen_h),
-                );
-
-                for (i, window) in ws.windows.iter().skip(1).enumerate() {
-                    let i = i as i32;
-                    let y = origin.y + i * slice_h;
-                    let h = if i == stack_count - 1 {
-                        origin.y + screen_h - y
-                    } else {
-                        slice_h
-                    };
-                    place_tile(&mut ws.space, window, (stack_x, y).into(), (stack_w, h));
-                }
-            }
-        }
-    }
-
-    /// Convenience: recalculate the active workspace.
-    pub fn recalculate_layout(&mut self) {
-        let output = self.output.clone();
-        let ws = &mut self.workspaces[self.active_workspace];
-        Self::recalculate_layout_for(ws, &output);
-    }
-
-    pub fn focus_window(&mut self, window: &Window) {
-        let ws = &mut self.workspaces[self.active_workspace];
-        ws.space.raise_element(window, true);
-        let surface = window
-            .toplevel()
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, surface, serial);
-    }
-
-    pub fn close_focused(&mut self) {
-        let Some(focused) = self.keyboard.current_focus() else {
-            info!("close_focused: nothing is focused");
-            return;
-        };
-
-        let ws = &mut self.workspaces[self.active_workspace];
-        let Some(idx) = ws
-            .windows
-            .iter()
-            .position(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&focused))
-        else {
-            warn!("close_focused: focused surface does not belong to a tracked window");
-            return;
-        };
-        let window = ws.windows.remove(idx);
-        if let Some(toplevel) = window.toplevel() {
-            toplevel.send_close();
-        }
-        ws.space.unmap_elem(&window);
-
-        let output = self.output.clone();
-        Self::recalculate_layout_for(
-            &mut self.workspaces[self.active_workspace],
-            &output,
-        );
-
-        let next_focus = self.workspaces[self.active_workspace]
-            .windows
-            .first()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, next_focus, serial);
-
-        self.needs_redraw = true;
-    }
-
-    pub fn focus_relative(&mut self, delta: isize) {
-        let ws = &self.workspaces[self.active_workspace];
-        if ws.windows.is_empty() {
-            return;
-        }
-        let len = ws.windows.len() as isize;
-        let current = self.keyboard.current_focus();
-        let current_idx = current.as_ref().and_then(|focused| {
-            ws.windows
-                .iter()
-                .position(|w| w.toplevel().map(|t| t.wl_surface()) == Some(focused))
-        });
-        let next_idx = match current_idx {
-            Some(i) => (i as isize + delta).rem_euclid(len) as usize,
-            None => 0,
-        };
-        let next = ws.windows[next_idx].clone();
-        self.focus_window(&next);
-    }
-
-    // ── Workspace operations ────────────────────────────────────────
-
-    pub fn switch_workspace(&mut self, idx: usize) {
-        if idx >= self.workspaces.len() {
-            warn!(idx, "switch_workspace: index out of range");
-            return;
-        }
-        if idx == self.active_workspace {
-            debug!(workspace = idx + 1, "already on this workspace");
-            return;
-        }
-
-        info!(
-            from = self.active_workspace + 1,
-            to = idx + 1,
-            "switching workspace"
-        );
-
-        self.active_workspace = idx;
-
-        // Update keyboard focus to whatever is on top of the new workspace.
-        let focus = self.workspaces[self.active_workspace]
-            .windows
-            .last()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, focus, serial);
-
-        self.needs_redraw = true;
-    }
-
-    pub fn move_to_workspace(&mut self, target_idx: usize) {
-        if target_idx >= self.workspaces.len() {
-            warn!(target_idx, "move_to_workspace: index out of range");
-            return;
-        }
-        if target_idx == self.active_workspace {
-            debug!(
-                workspace = target_idx + 1,
-                "move_to_workspace: window is already on this workspace"
-            );
-            return;
-        }
-
-        let Some(focused) = self.keyboard.current_focus() else {
-            info!("move_to_workspace: nothing is focused");
-            return;
-        };
-
-        let src_idx = self.active_workspace;
-
-        // Find the window in the source workspace.
-        let src_ws = &mut self.workspaces[src_idx];
-        let Some(win_idx) = src_ws
-            .windows
-            .iter()
-            .position(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&focused))
-        else {
-            warn!("move_to_workspace: focused surface not found in active workspace");
-            return;
-        };
-
-        let window = src_ws.windows.remove(win_idx);
-        src_ws.space.unmap_elem(&window);
-
-        info!(
-            from = src_idx + 1,
-            to = target_idx + 1,
-            "moving window to workspace"
-        );
-
-        // Add to target workspace.
-        let dst_ws = &mut self.workspaces[target_idx];
-        dst_ws.windows.push(window);
-
-        // Recalculate layout for both workspaces.
-        let output = self.output.clone();
-        Self::recalculate_layout_for(
-            &mut self.workspaces[src_idx],
-            &output,
-        );
-        Self::recalculate_layout_for(
-            &mut self.workspaces[target_idx],
-            &output,
-        );
-
-        // Update focus on the source (active) workspace.
-        let next_focus = self.workspaces[src_idx]
-            .windows
-            .last()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, next_focus, serial);
-
-        self.needs_redraw = true;
-    }
-}
-
-fn place_tile(
-    space: &mut Space<Window>,
-    window: &Window,
-    location: Point<i32, Logical>,
-    size: (i32, i32),
-) {
-    if let Some(toplevel) = window.toplevel() {
-        toplevel.with_pending_state(|s| {
-            s.size = Some(size.into());
-        });
-        toplevel.send_configure();
-    }
-    space.map_element(window.clone(), location, false);
-}
-
-fn handle_initial_configure(surface: &WlSurface, space: &Space<Window>) {
-    if let Some(window) = space
-        .elements()
-        .find(|w| w.toplevel().unwrap().wl_surface() == surface)
-    {
-        let initial_configure_sent = with_states(surface, |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .initial_configure_sent
-        });
-        if !initial_configure_sent {
-            window.toplevel().unwrap().send_configure();
-        }
-    }
-}
-
-// -------------------------------------------------------------------------
-// OutputHandler
-// -------------------------------------------------------------------------
-
-impl OutputHandler for State {}
-delegate_output!(State);
+mod handlers;
+mod input;
+mod layout;
+mod state;
+
+use input::{handle_ipc_command, handle_libinput_event, IpcCommand};
+use state::{
+    CalloopData, ClientState, DrmBackend, State, Workspace, CLEAR_COLOR, NUM_WORKSPACES,
+};
 
 // -------------------------------------------------------------------------
 // Entry point
@@ -744,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    info!("bootstrapping bare-metal Wayland compositor (Phase 7: Workspaces)");
+    info!("bootstrapping bare-metal Wayland compositor (Phase 10)");
 
     let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
     let loop_signal = event_loop.get_signal();
@@ -794,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compositor_state = CompositorState::new::<State>(&display_handle);
     let xdg_shell_state = XdgShellState::new::<State>(&display_handle);
     let xdg_decoration_state = XdgDecorationState::new::<State>(&display_handle);
+    let layer_shell_state = WlrLayerShellState::new::<State>(&display_handle);
     let shm_state = ShmState::new::<State>(&display_handle, vec![]);
     let output_manager_state =
         OutputManagerState::new_with_xdg_output::<State>(&display_handle);
@@ -991,6 +346,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         compositor_state,
         xdg_shell_state,
         xdg_decoration_state,
+        layer_shell_state,
         shm_state,
         output_manager_state,
         seat_state,
@@ -1053,223 +409,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("clean shutdown complete");
     Ok(())
-}
-
-// -------------------------------------------------------------------------
-// Keyboard filter
-// -------------------------------------------------------------------------
-
-/// Map a keysym _1 .. _9 to a 0-based workspace index.
-fn keysym_to_workspace_index(sym: Keysym) -> Option<usize> {
-    match sym {
-        Keysym::_1 => Some(0),
-        Keysym::_2 => Some(1),
-        Keysym::_3 => Some(2),
-        Keysym::_4 => Some(3),
-        Keysym::_5 => Some(4),
-        Keysym::_6 => Some(5),
-        Keysym::_7 => Some(6),
-        Keysym::_8 => Some(7),
-        Keysym::_9 => Some(8),
-        _ => None,
-    }
-}
-
-fn handle_keybinding(
-    _state: &mut State,
-    mods: &ModifiersState,
-    keysym_handle: KeysymHandle<'_>,
-    key_state: KeyState,
-) -> FilterResult<KeyAction> {
-    if key_state != KeyState::Pressed {
-        return FilterResult::Forward;
-    }
-
-    // We only handle chords that include Super, with no Ctrl or Alt.
-    if !mods.logo || mods.ctrl || mods.alt {
-        return FilterResult::Forward;
-    }
-
-    let sym = keysym_handle.modified_sym();
-
-    let action = if mods.shift {
-        // ── Super + Shift ───────────────────────────────────────────
-        debug!(?mods, sym = ?sym, "chord pressed (Super+Shift)");
-        match sym {
-            Keysym::Escape                          => KeyAction::Quit,
-            s if s == Keysym::r || s == Keysym::R   => KeyAction::ReloadConfig,
-            Keysym::Left                             => KeyAction::MoveWindowLeft,
-            Keysym::Right                            => KeyAction::MoveWindowRight,
-            _ => {
-                // Super+Shift+[1-9] → MoveToWorkspace
-                // When shift is held, xkb gives us the shifted symbol
-                // (e.g. '!' for Shift+1 on US layout). We need the
-                // *raw* (unshifted) keysym to detect number keys.
-                let raw_sym = keysym_handle.raw_syms().first().copied()
-                    .unwrap_or(sym);
-                if let Some(idx) = keysym_to_workspace_index(raw_sym) {
-                    KeyAction::MoveToWorkspace(idx)
-                } else {
-                    return FilterResult::Forward;
-                }
-            }
-        }
-    } else {
-        // ── Super only ──────────────────────────────────────────────
-        debug!(?mods, sym = ?sym, "chord pressed (Super)");
-        match sym {
-            Keysym::Return                           => KeyAction::SpawnTerminal,
-            s if s == Keysym::d || s == Keysym::D    => KeyAction::SpawnLauncher,
-            s if s == Keysym::q || s == Keysym::Q    => KeyAction::CloseFocused,
-            s if s == Keysym::f || s == Keysym::F    => KeyAction::ToggleFullscreen,
-            Keysym::space                            => KeyAction::ToggleFloating,
-            Keysym::Left                             => KeyAction::FocusLeft,
-            Keysym::Right                            => KeyAction::FocusRight,
-            _ => {
-                // Super+[1-9] → SwitchWorkspace
-                if let Some(idx) = keysym_to_workspace_index(sym) {
-                    KeyAction::SwitchWorkspace(idx)
-                } else {
-                    return FilterResult::Forward;
-                }
-            }
-        }
-    };
-
-    FilterResult::Intercept(action)
-}
-
-fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
-    let Some(action) = action else { return };
-
-    match action {
-        KeyAction::Quit => {
-            info!("kill switch triggered (Super+Shift+Escape) — stopping");
-            state.loop_signal.stop();
-        }
-        KeyAction::SpawnTerminal => spawn_terminal(),
-        KeyAction::CloseFocused => state.close_focused(),
-        KeyAction::FocusRight => state.focus_relative(1),
-        KeyAction::FocusLeft => state.focus_relative(-1),
-        KeyAction::ReloadConfig => {
-            info!("Action ReloadConfig not yet implemented");
-        }
-        KeyAction::SpawnLauncher => {
-            info!("Action SpawnLauncher not yet implemented");
-        }
-        KeyAction::ToggleFullscreen => {
-            info!("Action ToggleFullscreen not yet implemented");
-        }
-        KeyAction::ToggleFloating => {
-            info!("Action ToggleFloating not yet implemented");
-        }
-        KeyAction::MoveWindowLeft => {
-            info!("Action MoveWindow not yet implemented");
-        }
-        KeyAction::MoveWindowRight => {
-            info!("Action MoveWindow not yet implemented");
-        }
-        KeyAction::SwitchWorkspace(idx) => {
-            state.switch_workspace(idx);
-        }
-        KeyAction::MoveToWorkspace(idx) => {
-            state.move_to_workspace(idx);
-        }
-    }
-}
-
-fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputBackend>) {
-    match event {
-        InputEvent::Keyboard { event } => {
-            let serial = SERIAL_COUNTER.next_serial();
-            let time = event.time_msec();
-            let keycode = event.key_code();
-            let key_state = event.state();
-
-            let keyboard = state.keyboard.clone();
-            let action = keyboard.input::<KeyAction, _>(
-                state,
-                keycode,
-                key_state,
-                serial,
-                time,
-                |state, mods, keysym_handle| {
-                    handle_keybinding(state, mods, keysym_handle, key_state)
-                },
-            );
-            dispatch_action(state, action);
-        }
-
-        InputEvent::PointerMotion { event } => {
-            state.pointer_location.x += event.delta_x();
-            state.pointer_location.y += event.delta_y();
-            if let Some(geo) = state.workspaces[state.active_workspace]
-                .space
-                .output_geometry(&state.output)
-            {
-                state.pointer_location.x =
-                    state.pointer_location.x.clamp(0.0, geo.size.w as f64);
-                state.pointer_location.y =
-                    state.pointer_location.y.clamp(0.0, geo.size.h as f64);
-            }
-            trace!(
-                x = state.pointer_location.x,
-                y = state.pointer_location.y,
-                "libinput pointer moved"
-            );
-        }
-
-        InputEvent::PointerButton { event } => {
-            if event.state() != ButtonState::Pressed {
-                return;
-            }
-            let ws = &state.workspaces[state.active_workspace];
-            let hit = ws
-                .space
-                .element_under(state.pointer_location)
-                .map(|(w, _)| w.clone());
-            if let Some(window) = hit {
-                state.focus_window(&window);
-            }
-        }
-
-        InputEvent::DeviceAdded { device } => {
-            info!(name = %device.name(), "libinput: device added");
-        }
-        InputEvent::DeviceRemoved { device } => {
-            info!(name = %device.name(), "libinput: device removed");
-        }
-
-        _ => {}
-    }
-}
-
-fn handle_ipc_command(state: &mut State, cmd: IpcCommand) {
-    match cmd {
-        IpcCommand::Quit => {
-            info!("IPC: quit");
-            state.loop_signal.stop();
-        }
-        IpcCommand::SpawnTerminal => {
-            info!("IPC: spawn terminal");
-            spawn_terminal();
-        }
-        IpcCommand::CloseFocused => {
-            info!("IPC: close focused");
-            state.close_focused();
-        }
-    }
-}
-
-fn spawn_terminal() {
-    info!("spawning alacritty");
-    match Command::new("alacritty")
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => debug!(pid = child.id(), "alacritty spawned"),
-        Err(err) => warn!(?err, "failed to spawn alacritty"),
-    }
 }
 
 // -------------------------------------------------------------------------
