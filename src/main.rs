@@ -35,6 +35,7 @@ use smithay::{
     },
     desktop::{
         space::{space_render_elements, SpaceRenderElements},
+        layer_map_for_output,
         PopupManager, Space, Window, WindowSurfaceType,
     },
     input::{keyboard::XkbConfig, pointer::CursorImageStatus, Seat, SeatState},
@@ -964,6 +965,7 @@ fn render_frame(data: &mut CalloopData) {
     let now = state.start_time.elapsed();
     let output = state.output.clone();
 
+    // Send frame callbacks to tiled/floating windows.
     for ws in state.workspaces.iter() {
         ws.space.elements().for_each(|window| {
             window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
@@ -972,6 +974,18 @@ fn render_frame(data: &mut CalloopData) {
         });
     }
 
+    // Send frame callbacks to layer surfaces (waybar, fuzzel, etc.).
+    // Without this, layer surfaces that request wl_surface.frame() will
+    // never get the callback and stop redrawing — which is why fuzzel
+    // appears but cannot display typed characters.
+    {
+        let map = layer_map_for_output(&output);
+        for layer in map.layers() {
+            layer.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
+        }
+    }
     state.workspaces[state.active_workspace].space.refresh();
     state.popups.cleanup();
 
