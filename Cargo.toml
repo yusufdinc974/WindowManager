@@ -5,65 +5,29 @@ edition = "2021"
 description = "Phase 3: xdg-shell compositor hosting real Wayland clients."
 
 [dependencies]
-# Smithay is pulled from git because the crates.io release (0.3) is
-# significantly behind the API surface used by the reference compositor
-# `anvil` and the wider ecosystem.
-#
-# Features:
-#   - backend_winit     : run nested inside the host display server.
-#   - backend_egl       : EGL context/surface bindings (required by winit + GL).
-#   - renderer_gl       : the GlesRenderer we clear the screen with.
-#   - wayland_frontend  : enables the `wayland::*` modules (CompositorState,
-#                         ShmState, XdgShellState, seat globals, …) so real
-#                         Wayland clients can connect and talk to us.
-#   - desktop           : `Space`, `Window`, `render_output` — the
-#                         convenience layer for mapping/rendering toplevels
-#                         without hand-rolling the damage + z-order math.
 smithay = { git = "https://github.com/Smithay/smithay", default-features = false, features = [
     "backend_winit",
     "backend_egl",
     "renderer_gl",
     "wayland_frontend",
     "desktop",
-    # Phase 6a: session + input on bare metal.
-    #   backend_libinput         : /dev/input/event* → InputEvent<LibinputInputBackend>
-    #   backend_session          : the `Session` trait + pause/activate notifier
-    #   backend_session_libseat  : concrete LibSeatSession (logind / direct seat)
-    #   backend_udev             : enables `input/udev`, giving us
-    #                              `Libinput::new_with_udev` so we don't have to
-    #                              hand-enumerate /dev/input/event*. We don't
-    #                              use the UdevBackend itself yet — Phase 6b
-    #                              swaps winit for it.
     "backend_libinput",
     "backend_session",
     "backend_session_libseat",
     "backend_udev",
-    # Phase 6b: actually use the DRM device backend + GBM allocator.
     "backend_drm",
     "backend_gbm",
 ] }
 
-# Structured logging. `tracing` is the facade we annotate with; the
-# subscriber is what actually formats and writes events to stderr.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# IPC command schema + JSON (de)serialisation. External tools (CLI
-# helpers, keybindings in the host compositor) write line-terminated
-# JSON to `/tmp/mywm.sock`; we deserialise it into `IpcCommand`.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Phase 13: the Lua engine. `vendored` builds the Lua 5.4 interpreter from
-# source so we don't need liblua on the host; `serialize` enables
-# `mlua::LuaSerdeExt` for optional `serde ↔ Value` bridging later.
 mlua = { version = "0.9", features = ["lua54", "vendored", "serialize"] }
 
-# Ergonomic error types for the DRM bootstrap path — wraps smithay's
-# DrmError/EGL Error variants without hand-rolling Display impls.
 thiserror = "1"
 
 [profile.dev]
-# Smithay + GL can be slow in debug; opt-level=1 is a good compromise
-# between fast compile times and interactive-feeling iteration.
 opt-level = 1

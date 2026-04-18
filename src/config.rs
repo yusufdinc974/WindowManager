@@ -32,6 +32,7 @@ use tracing::{info, warn};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub terminal: String,
+    pub launcher: String,
     pub outer_gaps: i32,
     pub inner_gaps: i32,
     pub border_width: i32,
@@ -44,6 +45,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             terminal: "alacritty".to_string(),
+            launcher: "fuzzel".to_string(),
             outer_gaps: 15,
             inner_gaps: 10,
             border_width: 2,
@@ -144,6 +146,7 @@ impl Config {
 fn seed_wm_table(lua: &Lua, defaults: &Config) -> mlua::Result<()> {
     let wm = lua.create_table()?;
     wm.set("terminal", defaults.terminal.clone())?;
+    wm.set("launcher", defaults.launcher.clone())?;
     wm.set("outer_gaps", defaults.outer_gaps)?;
     wm.set("inner_gaps", defaults.inner_gaps)?;
     wm.set("border_width", defaults.border_width)?;
@@ -170,6 +173,7 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
     let wm: Table = lua.globals().get("wm")?;
 
     let terminal: String = get_or(&wm, "terminal", defaults.terminal.clone());
+    let launcher: String = get_or(&wm, "launcher", defaults.launcher.clone());
     let outer_gaps: i32 = get_or(&wm, "outer_gaps", defaults.outer_gaps);
     let inner_gaps: i32 = get_or(&wm, "inner_gaps", defaults.inner_gaps);
     let border_width: i32 = get_or(&wm, "border_width", defaults.border_width);
@@ -206,6 +210,7 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
 
     Ok(Config {
         terminal,
+        launcher,
         outer_gaps,
         inner_gaps,
         border_width,
@@ -277,6 +282,13 @@ local w = wm
 --  2.  Terminal
 -- ------------------------------------------------------------
 w.terminal = "alacritty"
+
+-- Application launcher. Spawned on Super+D via `sh -c`, so any
+-- arguments you pass here are parsed by the shell as usual.
+-- `fuzzel` is recommended — it is a native wlr-layer-shell launcher
+-- with no GTK3 dependency. `wofi --show drun` also works but its
+-- GTK3 seat initialisation is fragile on non-GNOME compositors.
+w.launcher = "fuzzel"
 
 -- ------------------------------------------------------------
 --  3.  Gaps & borders

@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsString,
     time::{Duration, Instant},
 };
 
@@ -15,7 +14,7 @@ use smithay::{
         },
         renderer::{element::solid::SolidColorBuffer, gles::GlesRenderer},
     },
-    desktop::{PopupManager, Space, Window},
+    desktop::{layer_map_for_output, PopupManager, Space, Window, WindowSurfaceType},
     input::{
         keyboard::KeyboardHandle,
         pointer::{CursorImageStatus, PointerHandle},
@@ -28,14 +27,15 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
-            DisplayHandle,
+            DisplayHandle, Resource,
         },
     },
-    utils::{Logical, Point, SERIAL_COUNTER},
+    utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
     wayland::{
-        compositor::{CompositorClientState, CompositorState},
+        compositor::{get_parent, CompositorClientState, CompositorState},
         dmabuf::DmabufState,
         output::OutputManagerState,
+        selection::data_device::DataDeviceState,
         shell::{
             wlr_layer::WlrLayerShellState,
             xdg::{decoration::XdgDecorationState, XdgShellState},
@@ -53,6 +53,32 @@ pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
 pub const ANIMATION_START_SCALE: f32 = 0.8;
 
 // -------------------------------------------------------------------------
+// Pointer grab state for interactive move / resize
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrabMode {
+    FloatingMove,
+    FloatingResize,
+    TiledMove,
+    TiledResize,
+}
+
+#[derive(Debug, Clone)]
+pub struct GrabState {
+    pub mode: GrabMode,
+    pub window: Window,
+    pub start_pointer: Point<f64, Logical>,
+    pub start_geo: Rectangle<i32, Logical>,
+    pub start_split_ratio: f32,
+    pub start_stack_ratios: Vec<f32>,
+    pub screen_width: i32,
+    pub screen_height: i32,
+    pub tiled_index: usize,
+    pub tiled_count: usize,
+}
+
+// -------------------------------------------------------------------------
 // Workspace
 // -------------------------------------------------------------------------
 
@@ -62,6 +88,10 @@ pub struct Workspace {
     pub spawn_times: HashMap<Window, Instant>,
     pub configured_sizes: HashMap<Window, (i32, i32)>,
     pub layout: LayoutType,
+    pub floating: HashSet<Window>,
+    pub floating_geo: HashMap<Window, Rectangle<i32, Logical>>,
+    pub split_ratio: f32,
+    pub stack_ratios: Vec<f32>,
 }
 
 impl Workspace {
@@ -74,6 +104,51 @@ impl Workspace {
             spawn_times: HashMap::new(),
             configured_sizes: HashMap::new(),
             layout: LayoutType::default(),
+            floating: HashSet::new(),
+            floating_geo: HashMap::new(),
+            split_ratio: 0.5,
+            stack_ratios: Vec::new(),
+        }
+    }
+
+    pub fn tiled_windows(&self) -> Vec<Window> {
+        self.windows
+            .iter()
+            .filter(|w| !self.floating.contains(w))
+            .cloned()
+            .collect()
+    }
+
+    pub fn ensure_stack_ratios(&mut self) {
+        let tiled = self.tiled_windows();
+        let stack_count = if tiled.len() > 1 { tiled.len() - 1 } else { 0 };
+
+        if stack_count == 0 {
+            self.stack_ratios.clear();
+            return;
+        }
+
+        if self.stack_ratios.len() != stack_count {
+            let equal = 1.0 / stack_count as f32;
+            self.stack_ratios = vec![equal; stack_count];
+        }
+    }
+
+    pub fn normalise_stack_ratios(&mut self) {
+        if self.stack_ratios.is_empty() {
+            return;
+        }
+        let min_ratio = 0.05;
+        for r in self.stack_ratios.iter_mut() {
+            if *r < min_ratio {
+                *r = min_ratio;
+            }
+        }
+        let sum: f32 = self.stack_ratios.iter().sum();
+        if sum > 0.0 {
+            for r in self.stack_ratios.iter_mut() {
+                *r /= sum;
+            }
         }
     }
 }
@@ -97,6 +172,15 @@ pub fn animation_alpha(progress: f32) -> f32 {
     progress.clamp(0.0, 1.0)
 }
 
+pub fn window_current_size(window: &Window) -> Option<Size<i32, Logical>> {
+    let geo = window.geometry();
+    if geo.size.w > 0 && geo.size.h > 0 {
+        return Some(geo.size);
+    }
+    let toplevel = window.toplevel()?;
+    toplevel.with_pending_state(|s| s.size)
+}
+
 // -------------------------------------------------------------------------
 // Compositor state
 // -------------------------------------------------------------------------
@@ -105,7 +189,7 @@ pub struct State {
     pub start_time: Instant,
     pub display_handle: DisplayHandle,
     pub loop_signal: LoopSignal,
-    pub socket_name: OsString,
+    pub socket_name: std::ffi::OsString,
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -115,6 +199,7 @@ pub struct State {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub dmabuf_state: DmabufState,
+    pub data_device_state: DataDeviceState,
 
     pub seat: Seat<Self>,
     pub keyboard: KeyboardHandle<Self>,
@@ -133,8 +218,9 @@ pub struct State {
     pub lua: Lua,
 
     pub needs_redraw: bool,
-
     pub renderer: GlesRenderer,
+
+    pub pointer_grab: Option<GrabState>,
 }
 
 #[derive(Default)]
@@ -181,13 +267,23 @@ pub struct CalloopData {
 }
 
 // -------------------------------------------------------------------------
-// Workspace / focus operations
+// Workspace / focus / floating operations
 // -------------------------------------------------------------------------
 
 impl State {
-    /// Focus a window: raise it, set keyboard focus, and — in Monocle
-    /// mode — immediately retile so the focused window is the visible one.
+    /// Returns true if a layer surface currently holds keyboard focus.
+    pub fn layer_has_keyboard_focus(&self) -> bool {
+        let Some(focused) = self.keyboard.current_focus() else {
+            return false;
+        };
+        self.layer_surface_of(&focused).is_some()
+    }
+
     pub fn focus_window(&mut self, window: &Window) {
+        if self.layer_has_keyboard_focus() {
+            return;
+        }
+
         let ws = &mut self.workspaces[self.active_workspace];
         ws.space.raise_element(window, true);
 
@@ -196,14 +292,34 @@ impl State {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, surface, serial);
 
-        // In Monocle the raise above is enough for the *current* frame,
-        // but we also retile so that `layout_monocle` records the
-        // correct focused surface for future retiles (e.g. triggered
-        // by commit handlers or animations).
         if self.workspaces[self.active_workspace].layout == LayoutType::Monocle {
             self.recalculate_layout();
             self.needs_redraw = true;
         }
+    }
+
+    pub fn layer_surface_of(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<smithay::desktop::LayerSurface> {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        let map = layer_map_for_output(&self.output);
+        map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+            .cloned()
+    }
+
+    pub fn drop_focus_to_active_window(&mut self) {
+        let fallback = self.workspaces[self.active_workspace]
+            .windows
+            .last()
+            .and_then(|w| w.toplevel())
+            .map(|t| t.wl_surface().clone());
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, fallback, serial);
     }
 
     pub fn close_focused(&mut self) {
@@ -211,6 +327,14 @@ impl State {
             info!("close_focused: nothing is focused");
             return;
         };
+
+        if let Some(layer) = self.layer_surface_of(&focused) {
+            info!(surface = ?focused.id(), "close_focused: closing layer surface");
+            layer.layer_surface().send_close();
+            self.drop_focus_to_active_window();
+            self.needs_redraw = true;
+            return;
+        }
 
         let ws = &mut self.workspaces[self.active_workspace];
         let Some(idx) = ws
@@ -224,13 +348,15 @@ impl State {
         let window = ws.windows.remove(idx);
         ws.spawn_times.remove(&window);
         ws.configured_sizes.remove(&window);
+        ws.floating.remove(&window);
+        ws.floating_geo.remove(&window);
         if let Some(toplevel) = window.toplevel() {
             toplevel.send_close();
         }
         ws.space.unmap_elem(&window);
 
-        // Set focus to the next candidate BEFORE retiling so
-        // layout_monocle can raise the correct window.
+        ws.stack_ratios.clear();
+
         let next_focus = self.workspaces[self.active_workspace]
             .windows
             .last()
@@ -240,12 +366,15 @@ impl State {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, next_focus, serial);
 
-        // Now retile with the updated focus.
         self.recalculate_layout();
         self.needs_redraw = true;
     }
 
     pub fn focus_relative(&mut self, delta: isize) {
+        if self.layer_has_keyboard_focus() {
+            return;
+        }
+
         let ws = &self.workspaces[self.active_workspace];
         if ws.windows.is_empty() {
             return;
@@ -262,8 +391,6 @@ impl State {
             None => 0,
         };
         let next = ws.windows[next_idx].clone();
-
-        // focus_window handles raise + retile for Monocle.
         self.focus_window(&next);
         self.needs_redraw = true;
     }
@@ -296,7 +423,6 @@ impl State {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, focus, serial);
 
-        // Retile so Monocle raises the focused window on this workspace.
         self.recalculate_layout();
         self.needs_redraw = true;
     }
@@ -319,6 +445,10 @@ impl State {
             return;
         };
 
+        if self.layer_has_keyboard_focus() {
+            return;
+        }
+
         let src_idx = self.active_workspace;
 
         let src_ws = &mut self.workspaces[src_idx];
@@ -334,7 +464,10 @@ impl State {
         let window = src_ws.windows.remove(win_idx);
         let spawn_time = src_ws.spawn_times.remove(&window);
         let configured_size = src_ws.configured_sizes.remove(&window);
+        let was_floating = src_ws.floating.remove(&window);
+        let float_geo = src_ws.floating_geo.remove(&window);
         src_ws.space.unmap_elem(&window);
+        src_ws.stack_ratios.clear();
 
         info!(
             from = src_idx + 1,
@@ -349,9 +482,15 @@ impl State {
         if let Some(sz) = configured_size {
             dst_ws.configured_sizes.insert(window.clone(), sz);
         }
+        if was_floating {
+            dst_ws.floating.insert(window.clone());
+        }
+        if let Some(geo) = float_geo {
+            dst_ws.floating_geo.insert(window.clone(), geo);
+        }
         dst_ws.windows.push(window);
+        dst_ws.stack_ratios.clear();
 
-        // Update focus on the source workspace BEFORE retiling.
         let next_focus = self.workspaces[src_idx]
             .windows
             .last()
@@ -361,7 +500,6 @@ impl State {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, next_focus.clone(), serial);
 
-        // Now retile both workspaces with the correct focus info.
         let output = self.output.clone();
         let outer = self.config.outer_gaps;
         let inner = self.config.inner_gaps;
@@ -374,8 +512,6 @@ impl State {
             border,
             next_focus.as_ref(),
         );
-        // The destination workspace is not active, so no surface there
-        // holds focus — pass None (Monocle falls back to last window).
         Self::recalculate_layout_for(
             &mut self.workspaces[target_idx],
             &output,
@@ -395,6 +531,104 @@ impl State {
                 .values()
                 .any(|t| animation_progress(now, *t).is_some())
         })
+    }
+
+    pub fn toggle_floating(&mut self) {
+        if self.layer_has_keyboard_focus() {
+            return;
+        }
+
+        let Some(focused) = self.keyboard.current_focus() else {
+            info!("toggle_floating: nothing is focused");
+            return;
+        };
+
+        let ws = &mut self.workspaces[self.active_workspace];
+        let Some(window) = ws
+            .windows
+            .iter()
+            .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&focused))
+            .cloned()
+        else {
+            warn!("toggle_floating: focused surface not tracked");
+            return;
+        };
+
+        if ws.floating.contains(&window) {
+            info!(
+                surface = ?focused.id(),
+                "toggle_floating: returning to tiled"
+            );
+            ws.floating.remove(&window);
+            ws.floating_geo.remove(&window);
+        } else {
+            let loc = ws
+                .space
+                .element_location(&window)
+                .unwrap_or_else(|| Point::from((100, 100)));
+
+            let size = window_current_size(&window)
+                .unwrap_or_else(|| Size::from((640, 480)));
+
+            let geo = Rectangle::new(loc, size);
+            info!(
+                surface = ?focused.id(),
+                ?geo,
+                "toggle_floating: popping out to floating"
+            );
+            ws.floating.insert(window.clone());
+            ws.floating_geo.insert(window.clone(), geo);
+        }
+
+        ws.stack_ratios.clear();
+        ws.space.raise_element(&window, true);
+
+        self.recalculate_layout();
+        self.needs_redraw = true;
+    }
+
+    pub fn ensure_floating(&mut self, window: &Window) {
+        let ws = &mut self.workspaces[self.active_workspace];
+        if ws.floating.contains(window) {
+            return;
+        }
+
+        let loc = ws
+            .space
+            .element_location(window)
+            .unwrap_or_else(|| Point::from((100, 100)));
+
+        let size = window_current_size(window)
+            .unwrap_or_else(|| Size::from((640, 480)));
+
+        let geo = Rectangle::new(loc, size);
+        ws.floating.insert(window.clone());
+        ws.floating_geo.insert(window.clone(), geo);
+        ws.stack_ratios.clear();
+
+        let focused = self.keyboard.current_focus();
+        let output = self.output.clone();
+        let outer = self.config.outer_gaps;
+        let inner = self.config.inner_gaps;
+        let border = self.config.border_width;
+        let ws = &mut self.workspaces[self.active_workspace];
+        Self::recalculate_layout_for(ws, &output, outer, inner, border, focused.as_ref());
+    }
+
+    pub fn swap_windows(&mut self, idx_a: usize, idx_b: usize) {
+        let ws = &mut self.workspaces[self.active_workspace];
+        if idx_a == idx_b || idx_a >= ws.windows.len() || idx_b >= ws.windows.len() {
+            return;
+        }
+        info!(
+            idx_a,
+            idx_b,
+            "swap_windows: swapping tiled window positions"
+        );
+        ws.windows.swap(idx_a, idx_b);
+        ws.stack_ratios.clear();
+        self.recalculate_layout();
+        self.needs_redraw = true;
     }
 
     pub fn cycle_theme(&mut self) {

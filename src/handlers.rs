@@ -4,10 +4,13 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
-        renderer::{utils::on_commit_buffer_handler, ImportDma},
+        renderer::{
+            utils::{on_commit_buffer_handler, RendererSurfaceStateUserData},
+            ImportDma,
+        },
     },
-    delegate_compositor, delegate_dmabuf, delegate_layer_shell, delegate_output, delegate_seat,
-    delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
+    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{layer_map_for_output, LayerSurface, Window, WindowSurfaceType},
     input::{pointer::CursorImageStatus, Seat, SeatHandler, SeatState},
     output::Output,
@@ -32,10 +35,16 @@ use smithay::{
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::OutputHandler,
+        selection::{
+            data_device::{
+                DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
+            },
+            SelectionHandler,
+        },
         shell::{
             wlr_layer::{
-                Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
-                WlrLayerShellState,
+                KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface,
+                WlrLayerShellHandler, WlrLayerShellState,
             },
             xdg::{
                 decoration::XdgDecorationHandler,
@@ -110,7 +119,8 @@ impl CompositorHandler for State {
 
         handle_initial_configure_all(surface, &self.workspaces);
 
-        if handle_layer_commit(surface, &self.output) {
+        let (layer_commit, focus_target) = handle_layer_commit(surface, &self.output);
+        if layer_commit {
             debug!("layer commit triggered retile");
             let out = self.output.clone();
             let outer = self.config.outer_gaps;
@@ -119,6 +129,17 @@ impl CompositorHandler for State {
             let focused = self.keyboard.current_focus();
             for ws in self.workspaces.iter_mut() {
                 Self::recalculate_layout_for(ws, &out, outer, inner, border, focused.as_ref());
+            }
+        }
+        if let Some(target) = focus_target {
+            let keyboard = self.keyboard.clone();
+            if keyboard.current_focus().as_ref() != Some(&target) {
+                info!(
+                    surface = ?target.id(),
+                    "focusing layer surface (Exclusive/OnDemand)"
+                );
+                let serial = SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(self, Some(target), serial);
             }
         }
 
@@ -176,6 +197,24 @@ impl DmabufHandler for State {
 delegate_dmabuf!(State);
 
 // -------------------------------------------------------------------------
+// SelectionHandler / DataDeviceHandler
+// -------------------------------------------------------------------------
+
+impl SelectionHandler for State {
+    type SelectionUserData = ();
+}
+
+impl DataDeviceHandler for State {
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device_state
+    }
+}
+
+impl WaylandDndGrabHandler for State {}
+
+delegate_data_device!(State);
+
+// -------------------------------------------------------------------------
 // XdgShellHandler
 // -------------------------------------------------------------------------
 
@@ -199,6 +238,10 @@ impl XdgShellHandler for State {
         let outer = self.config.outer_gaps;
         let inner = self.config.inner_gaps;
         let border = self.config.border_width;
+
+        let layer_has_focus = self.layer_has_keyboard_focus();
+        let new_surface = surface.wl_surface().clone();
+
         let ws = &mut self.workspaces[ws_idx];
         ws.spawn_times.insert(window.clone(), Instant::now());
         ws.windows.push(window.clone());
@@ -208,16 +251,13 @@ impl XdgShellHandler for State {
             "about to recalculate_layout_for"
         );
 
-        // The new window is about to receive focus, so pass its surface
-        // so Monocle raises it.
-        let new_surface = surface.wl_surface().clone();
         Self::recalculate_layout_for(
             ws,
             &self.output,
             outer,
             inner,
             border,
-            Some(&new_surface),
+            if layer_has_focus { None } else { Some(&new_surface) },
         );
 
         if let Some(toplevel) = window.toplevel() {
@@ -236,10 +276,12 @@ impl XdgShellHandler for State {
         );
         surface.send_configure();
 
-        let wl_surface = surface.wl_surface().clone();
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, Some(wl_surface), serial);
+        if !layer_has_focus {
+            let wl_surface = surface.wl_surface().clone();
+            let serial = SERIAL_COUNTER.next_serial();
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, Some(wl_surface), serial);
+        }
 
         self.needs_redraw = true;
 
@@ -258,6 +300,17 @@ impl XdgShellHandler for State {
             "xdg toplevel destroyed"
         );
 
+        if let Some(ref grab) = self.pointer_grab {
+            let grab_matches = grab
+                .window
+                .toplevel()
+                .map(|t| t.wl_surface() == &dying_surface)
+                .unwrap_or(false);
+            if grab_matches {
+                self.pointer_grab = None;
+            }
+        }
+
         for (i, ws) in self.workspaces.iter_mut().enumerate() {
             let had_window = ws.windows.len();
             ws.windows
@@ -265,6 +318,10 @@ impl XdgShellHandler for State {
             ws.spawn_times
                 .retain(|w, _| w.toplevel().map(|t| t.wl_surface()) != Some(&dying_surface));
             ws.configured_sizes
+                .retain(|w, _| w.toplevel().map(|t| t.wl_surface()) != Some(&dying_surface));
+            ws.floating
+                .retain(|w| w.toplevel().map(|t| t.wl_surface()) != Some(&dying_surface));
+            ws.floating_geo
                 .retain(|w, _| w.toplevel().map(|t| t.wl_surface()) != Some(&dying_surface));
 
             if ws.windows.len() != had_window {
@@ -285,19 +342,21 @@ impl XdgShellHandler for State {
             }
         }
 
-        // Update focus before retiling so Monocle raises the right window.
-        let focus = self.workspaces[self.active_workspace]
-            .windows
-            .last()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, focus.clone(), serial);
+        if !self.layer_has_keyboard_focus() {
+            let focus = self.workspaces[self.active_workspace]
+                .windows
+                .last()
+                .and_then(|w| w.toplevel())
+                .map(|t| t.wl_surface().clone());
+            let serial = SERIAL_COUNTER.next_serial();
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, focus.clone(), serial);
+        }
 
         let outer = self.config.outer_gaps;
         let inner = self.config.inner_gaps;
         let border = self.config.border_width;
+        let focus = self.keyboard.current_focus();
         for ws in self.workspaces.iter_mut() {
             Self::recalculate_layout_for(ws, &self.output, outer, inner, border, focus.as_ref());
         }
@@ -443,6 +502,7 @@ impl WlrLayerShellHandler for State {
                 warn!(?err, "failed to map layer surface");
                 return;
             }
+            map.arrange();
         }
 
         let out = self.output.clone();
@@ -458,6 +518,9 @@ impl WlrLayerShellHandler for State {
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         let output = self.output.clone();
+
+        let dying_wl = surface.wl_surface().clone();
+
         {
             let mut map = layer_map_for_output(&output);
             let found = map
@@ -467,6 +530,13 @@ impl WlrLayerShellHandler for State {
             if let Some(layer) = found {
                 map.unmap_layer(&layer);
             }
+            map.arrange();
+        }
+
+        let focus_on_dying = self.keyboard.current_focus().as_ref() == Some(&dying_wl);
+        if focus_on_dying {
+            info!("focused layer surface destroyed — dropping focus to active window");
+            self.drop_focus_to_active_window();
         }
 
         let outer = self.config.outer_gaps;
@@ -493,28 +563,65 @@ delegate_output!(State);
 // Private helpers
 // -------------------------------------------------------------------------
 
-fn handle_layer_commit(surface: &WlSurface, output: &Output) -> bool {
-    let mut map = layer_map_for_output(output);
-    let Some(layer) = map
-        .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
-        .cloned()
-    else {
-        return false;
+fn handle_layer_commit(
+    surface: &WlSurface,
+    output: &Output,
+) -> (bool, Option<WlSurface>) {
+    let layer = {
+        let map = layer_map_for_output(output);
+        match map
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .cloned()
+        {
+            Some(l) => l,
+            None => return (false, None),
+        }
     };
 
-    map.arrange();
+    {
+        let mut map = layer_map_for_output(output);
+        map.arrange();
+    }
 
-    let initial_configure_sent = with_states(surface, |states| {
+    let configure_sent = layer.layer_surface().send_pending_configure().is_some();
+    if configure_sent {
+        debug!(
+            surface = ?surface.id(),
+            "layer commit: sent configure (initial or size change)"
+        );
+    }
+
+    let has_buffer = with_states(surface, |states| {
         states
             .data_map
-            .get::<LayerSurfaceData>()
-            .map(|data| data.lock().unwrap().initial_configure_sent)
+            .get::<RendererSurfaceStateUserData>()
+            .map(|data| data.lock().unwrap().buffer().is_some())
             .unwrap_or(false)
     });
-    if !initial_configure_sent {
-        layer.layer_surface().send_configure();
+
+    if !has_buffer {
+        return (true, None);
     }
-    true
+
+    let interactivity = layer.cached_state().keyboard_interactivity;
+    let focus_target = match interactivity {
+        KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand => {
+            Some(layer.wl_surface().clone())
+        }
+        KeyboardInteractivity::None => {
+            if layer.can_receive_keyboard_focus() {
+                debug!(
+                    surface = ?surface.id(),
+                    "layer commit: cached_state says None but can_receive_keyboard_focus is true"
+                );
+                Some(layer.wl_surface().clone())
+            } else {
+                None
+            }
+        }
+    };
+
+    (true, focus_target)
 }
 
 fn handle_initial_configure_all(surface: &WlSurface, workspaces: &[crate::state::Workspace]) {

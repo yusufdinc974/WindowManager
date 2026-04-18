@@ -60,6 +60,7 @@ use smithay::{
         compositor::CompositorState,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         output::OutputManagerState,
+        selection::data_device::DataDeviceState,
         shell::{
             wlr_layer::WlrLayerShellState,
             xdg::{decoration::XdgDecorationState, XdgShellState},
@@ -81,6 +82,86 @@ use input::{handle_ipc_command, handle_libinput_event, IpcCommand};
 use state::{
     CalloopData, ClientState, DrmBackend, State, Workspace, CLEAR_COLOR,
 };
+
+// -------------------------------------------------------------------------
+// Session environment isolation
+// -------------------------------------------------------------------------
+
+/// Forcibly configure the process environment so that every child process
+/// (terminals, browsers, launchers …) connects to OUR Wayland display and
+/// never falls back to an X11/Wayland session on another TTY.
+///
+/// This MUST run:
+///   1. AFTER the listening socket is created (so we know the socket name),
+///   2. BEFORE any `std::process::Command` spawn (autostart, terminals …).
+///
+/// The function is intentionally aggressive: it clears every variable that
+/// could make a child discover a foreign display server or session bus.
+fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
+    // ── Core Wayland identity ──
+    std::env::set_var("WAYLAND_DISPLAY", socket_name);
+    std::env::set_var("XDG_SESSION_TYPE", "wayland");
+    std::env::set_var("XDG_CURRENT_DESKTOP", "mywm");
+    std::env::set_var("XDG_SESSION_DESKTOP", "mywm");
+
+    // ── Kill any X11 fallback path ──
+    // Removing DISPLAY prevents GTK / Qt / SDL from finding an Xwayland
+    // or bare X server on another VT.
+    std::env::remove_var("DISPLAY");
+
+    // ── Per-toolkit Wayland enforcement ──
+    // Firefox / Thunderbird (Gecko)
+    std::env::set_var("MOZ_ENABLE_WAYLAND", "1");
+    std::env::set_var("MOZ_DBUS_REMOTE", "0"); // prevent DBus remote activation on TTY2
+
+    // GTK 3/4
+    std::env::set_var("GDK_BACKEND", "wayland");
+
+    // Qt 5/6
+    std::env::set_var("QT_QPA_PLATFORM", "wayland");
+    std::env::set_var("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1");
+
+    // SDL2 (games, mpv …)
+    std::env::set_var("SDL_VIDEODRIVER", "wayland");
+
+    // winit (Alacritty, wezterm …)
+    std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
+
+    // Clutter (legacy GNOME apps)
+    std::env::set_var("CLUTTER_BACKEND", "wayland");
+
+    // Electron / Chromium
+    // (Electron reads ELECTRON_OZONE_PLATFORM_HINT; Chromium reads
+    //  --ozone-platform=wayland but the env var also works.)
+    std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
+
+    // ── DBus session isolation ──
+    // If a session bus from TTY2 leaked into our environment, apps like
+    // Firefox use it to activate an existing instance on TTY2 instead of
+    // opening a new window on our display. Clear it so apps either start
+    // a new bus or skip single-instance checks.
+    //
+    // NOTE: this means autostart entries that need DBus (e.g. waybar
+    // with the tray module) should launch `dbus-daemon` themselves or
+    // the rc.lua autostart list should include:
+    //   "eval $(dbus-launch --sh-syntax)"
+    // Uncomment the next line ONLY if you see windows teleporting to TTY2:
+    // std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
+
+    // A safer alternative: override the bus address so a NEW per-session
+    // bus is spawned automatically by the first client that needs one.
+    // This keeps DBus functional while isolating us from TTY2's bus.
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let our_bus_path = format!("unix:path={}/mywm-bus-{}", runtime_dir, std::process::id());
+        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &our_bus_path);
+        info!(bus = %our_bus_path, "session: overriding DBUS_SESSION_BUS_ADDRESS for isolation");
+    }
+
+    info!(
+        wayland_display = ?socket_name,
+        "session: environment variables locked to this compositor"
+    );
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -151,10 +232,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shm_state = ShmState::new::<State>(&display_handle, vec![]);
     let output_manager_state =
         OutputManagerState::new_with_xdg_output::<State>(&display_handle);
+    let data_device_state = DataDeviceState::new::<State>(&display_handle);
 
     let mut seat_state: SeatState<State> = SeatState::new();
+
     let mut seat: Seat<State> =
         seat_state.new_wl_seat(&display_handle, "seat0");
+
     let keyboard = seat
         .add_keyboard(XkbConfig::default(), 200, 25)
         .map_err(|e| format!("failed to initialise keyboard: {e:?}"))?;
@@ -168,9 +252,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     info!(count = workspace_count, "workspaces initialised");
 
+    // ── Create the listening socket ──
     let listening_socket = ListeningSocketSource::new_auto()?;
     let socket_name = listening_socket.socket_name().to_os_string();
     info!(?socket_name, "listening for wayland clients");
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CRITICAL: Lock the environment to THIS compositor BEFORE any
+    //  child process can be spawned (event sources, autostart, etc.).
+    // ══════════════════════════════════════════════════════════════════
+    isolate_session_environment(&socket_name);
 
     event_loop
         .handle()
@@ -321,17 +412,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    std::env::set_var("WAYLAND_DISPLAY", &socket_name);
-    std::env::set_var("XDG_SESSION_TYPE", "wayland");
-    std::env::remove_var("DISPLAY");
-    std::env::set_var("GDK_BACKEND", "wayland");
-    std::env::set_var("QT_QPA_PLATFORM", "wayland");
-    std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
-    info!(
-        wayland_display = ?socket_name,
-        "environment variables set for child processes"
-    );
-
+    // ── Autostart (runs AFTER env isolation) ──
     {
         let autostart_result: Result<mlua::Value, _> =
             lua.load("return wm.autostart").eval();
@@ -365,6 +446,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output_manager_state,
         seat_state,
         dmabuf_state,
+        data_device_state,
         seat,
         keyboard,
         pointer,
@@ -379,6 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lua,
         needs_redraw: true,
         renderer,
+        pointer_grab: None,
     };
 
     let mut data = CalloopData {
@@ -433,7 +516,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // -------------------------------------------------------------------------
-// DRM backend — renderer is returned separately, goes into State
+// DRM backend
 // -------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]

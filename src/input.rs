@@ -1,6 +1,7 @@
-//! Keyboard / pointer routing and IPC command dispatch.
+//! Keyboard / pointer routing, IPC command dispatch, and interactive grabs.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -13,18 +14,22 @@ use smithay::{
         libinput::LibinputInputBackend,
     },
     desktop::{layer_map_for_output, WindowSurfaceType},
+    wayland::compositor::get_parent,
     input::{
         keyboard::{FilterResult, Keysym, KeysymHandle, ModifiersState},
         pointer::{ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point, SERIAL_COUNTER},
+    utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
     wayland::shell::wlr_layer::Layer as WlrLayer,
 };
 use tracing::{debug, info, trace, warn};
 
 use crate::layout::LayoutType;
-use crate::state::State;
+use crate::state::{window_current_size, GrabMode, GrabState, State};
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
 
 // -------------------------------------------------------------------------
 // Action / IPC command types
@@ -39,6 +44,7 @@ pub enum KeyAction {
     CloseFocused,
     ToggleFullscreen,
     CycleLayout,
+    ToggleFloating,
     FocusLeft,
     FocusRight,
     MoveWindowLeft,
@@ -47,6 +53,8 @@ pub enum KeyAction {
     MoveToWorkspace(usize),
     CycleTheme,
     ToggleNavbar,
+    /// Intercepted but already handled inline by the keyboard filter.
+    NoOp,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -76,20 +84,51 @@ fn keysym_to_workspace_index(sym: Keysym) -> Option<usize> {
 }
 
 fn handle_keybinding(
-    _state: &mut State,
+    state: &mut State,
     mods: &ModifiersState,
     keysym_handle: KeysymHandle<'_>,
     key_state: KeyState,
 ) -> FilterResult<KeyAction> {
+    // Always forward key releases — clients need them.
     if key_state != KeyState::Pressed {
         return FilterResult::Forward;
     }
 
-    if !mods.logo || mods.ctrl || mods.alt {
+    let sym = keysym_handle.modified_sym();
+    let on_layer = state.layer_has_keyboard_focus();
+
+    // Plain Escape with focus on a layer surface: dismiss it.
+    if sym == Keysym::Escape
+        && !mods.logo
+        && !mods.ctrl
+        && !mods.alt
+        && !mods.shift
+    {
+        if on_layer {
+            if let Some(focused) = state.keyboard.current_focus() {
+                if let Some(layer) = state.layer_surface_of(&focused) {
+                    info!("Escape pressed on layer surface — closing");
+                    layer.layer_surface().send_close();
+                    state.drop_focus_to_active_window();
+                    state.needs_redraw = true;
+                    return FilterResult::Intercept(KeyAction::NoOp);
+                }
+            }
+        }
         return FilterResult::Forward;
     }
 
-    let sym = keysym_handle.modified_sym();
+    // If Super is NOT held, forward to the focused client unconditionally.
+    if !mods.logo {
+        return FilterResult::Forward;
+    }
+
+    // Super IS held. If focus is on a layer surface, only handle
+    // compositor-level bindings — forward everything else so the
+    // layer client can use Super+<key> combos if it wants.
+    if mods.ctrl || mods.alt {
+        return FilterResult::Forward;
+    }
 
     let action = if mods.shift {
         debug!(?mods, sym = ?sym, "chord pressed (Super+Shift)");
@@ -98,6 +137,7 @@ fn handle_keybinding(
             s if s == Keysym::r || s == Keysym::R   => KeyAction::ReloadConfig,
             Keysym::Left                             => KeyAction::MoveWindowLeft,
             Keysym::Right                            => KeyAction::MoveWindowRight,
+            Keysym::space                            => KeyAction::ToggleFloating,
             _ => {
                 let raw_sym = keysym_handle.raw_syms().first().copied()
                     .unwrap_or(sym);
@@ -148,14 +188,15 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         KeyAction::ReloadConfig => {
             info!("Action ReloadConfig not yet implemented");
         }
-        KeyAction::SpawnLauncher => {
-            info!("Action SpawnLauncher not yet implemented");
-        }
-                KeyAction::ToggleFullscreen => {
+        KeyAction::SpawnLauncher => spawn_launcher(&state.config.launcher),
+        KeyAction::ToggleFullscreen => {
             info!("Action ToggleFullscreen not yet implemented");
         }
         KeyAction::CycleLayout => {
             state.cycle_layout();
+        }
+        KeyAction::ToggleFloating => {
+            state.toggle_floating();
         }
         KeyAction::MoveWindowLeft => {
             info!("Action MoveWindowLeft not yet implemented");
@@ -175,7 +216,53 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         KeyAction::ToggleNavbar => {
             state.toggle_navbar();
         }
+        KeyAction::NoOp => {}
     }
+}
+
+// -------------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------------
+
+fn usable_screen_dimensions(state: &State) -> (i32, i32) {
+    let ws = &state.workspaces[state.active_workspace];
+    let geo = ws
+        .space
+        .output_geometry(&state.output)
+        .unwrap_or_default();
+    let non_exclusive = layer_map_for_output(&state.output).non_exclusive_zone();
+    let outer = state.config.outer_gaps;
+    let w = (non_exclusive.size.w.min(geo.size.w) - 2 * outer).max(1);
+    let h = (non_exclusive.size.h.min(geo.size.h) - 2 * outer).max(1);
+    (w, h)
+}
+
+/// Find the window under the pointer, with a fallback that checks
+/// bounding boxes including border areas.
+fn hit_test_window(state: &State, pos: Point<f64, Logical>) -> Option<smithay::desktop::Window> {
+    let ws = &state.workspaces[state.active_workspace];
+
+    if let Some((w, _)) = ws.space.element_under(pos) {
+        return Some(w.clone());
+    }
+
+    let bw = state.config.border_width.max(0);
+    ws.windows.iter().find(|w| {
+        if let Some(loc) = ws.space.element_location(w) {
+            let size = window_current_size(w)
+                .unwrap_or_else(|| Size::from((0, 0)));
+            let rx = loc.x - bw;
+            let ry = loc.y - bw;
+            let rw = size.w + 2 * bw;
+            let rh = size.h + 2 * bw;
+            pos.x >= rx as f64
+                && pos.x <= (rx + rw) as f64
+                && pos.y >= ry as f64
+                && pos.y <= (ry + rh) as f64
+        } else {
+            false
+        }
+    }).cloned()
 }
 
 // -------------------------------------------------------------------------
@@ -207,6 +294,7 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
         InputEvent::PointerMotion { event } => {
             state.pointer_location.x += event.delta_x();
             state.pointer_location.y += event.delta_y();
+
             if let Some(geo) = state.workspaces[state.active_workspace]
                 .space
                 .output_geometry(&state.output)
@@ -223,31 +311,163 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             );
 
             let pos = state.pointer_location;
+
+            // ── Interactive grab handling ──
+            if let Some(grab) = state.pointer_grab.clone() {
+                let dx = pos.x - grab.start_pointer.x;
+                let dy = pos.y - grab.start_pointer.y;
+
+                match grab.mode {
+                    GrabMode::FloatingMove => {
+                        let new_x = grab.start_geo.loc.x + dx as i32;
+                        let new_y = grab.start_geo.loc.y + dy as i32;
+
+                        let ws = &mut state.workspaces[state.active_workspace];
+                        if let Some(geo) = ws.floating_geo.get_mut(&grab.window) {
+                            geo.loc = Point::from((new_x, new_y));
+                        }
+                        let bw = state.config.border_width.max(0);
+                        ws.space.map_element(
+                            grab.window.clone(),
+                            Point::from((new_x + bw, new_y + bw)),
+                            false,
+                        );
+                        ws.space.raise_element(&grab.window, false);
+                        state.needs_redraw = true;
+                    }
+
+                    GrabMode::FloatingResize => {
+                        let new_w = (grab.start_geo.size.w + dx as i32).max(64);
+                        let new_h = (grab.start_geo.size.h + dy as i32).max(64);
+
+                        let ws = &mut state.workspaces[state.active_workspace];
+                        if let Some(geo) = ws.floating_geo.get_mut(&grab.window) {
+                            geo.size = Size::from((new_w, new_h));
+                        }
+
+                        let bw = state.config.border_width.max(0);
+                        let inner_w = (new_w - 2 * bw).max(1);
+                        let inner_h = (new_h - 2 * bw).max(1);
+                        let final_size = (inner_w, inner_h);
+
+                        if let Some(toplevel) = grab.window.toplevel() {
+                            toplevel.with_pending_state(|s| {
+                                s.size = Some(final_size.into());
+                            });
+                            let last = ws.configured_sizes.get(&grab.window).copied();
+                            if last != Some(final_size) {
+                                toplevel.send_configure();
+                                ws.configured_sizes.insert(grab.window.clone(), final_size);
+                            }
+                        }
+                        ws.space.raise_element(&grab.window, false);
+                        state.needs_redraw = true;
+                    }
+
+                    GrabMode::TiledMove => {
+                        state.needs_redraw = true;
+                    }
+
+                    GrabMode::TiledResize => {
+                        let ws = &mut state.workspaces[state.active_workspace];
+
+                        if grab.screen_width > 0 && grab.tiled_count > 1 {
+                            let ratio_dx = dx as f32 / grab.screen_width as f32;
+                            let new_ratio =
+                                (grab.start_split_ratio + ratio_dx).clamp(0.1, 0.9);
+                            ws.split_ratio = new_ratio;
+                        }
+
+                        if grab.tiled_count > 2 && grab.tiled_index > 0 {
+                            let stack_idx = grab.tiled_index - 1;
+                            let stack_count = grab.tiled_count - 1;
+
+                            if stack_idx < stack_count && grab.screen_height > 0 {
+                                let ratio_dy = dy as f32 / grab.screen_height as f32;
+
+                                let mut ratios = grab.start_stack_ratios.clone();
+
+                                if ratios.len() != stack_count {
+                                    let eq = 1.0 / stack_count as f32;
+                                    ratios = vec![eq; stack_count];
+                                }
+
+                                if stack_idx + 1 < stack_count {
+                                    ratios[stack_idx] =
+                                        (grab.start_stack_ratios[stack_idx] + ratio_dy)
+                                            .clamp(0.05, 0.95);
+                                    ratios[stack_idx + 1] =
+                                        (grab.start_stack_ratios[stack_idx + 1] - ratio_dy)
+                                            .clamp(0.05, 0.95);
+                                } else {
+                                    if stack_idx > 0 {
+                                        ratios[stack_idx] =
+                                            (grab.start_stack_ratios[stack_idx] + ratio_dy)
+                                                .clamp(0.05, 0.95);
+                                        ratios[stack_idx - 1] =
+                                            (grab.start_stack_ratios[stack_idx - 1] - ratio_dy)
+                                                .clamp(0.05, 0.95);
+                                    }
+                                }
+
+                                let sum: f32 = ratios.iter().sum();
+                                if sum > 0.0 {
+                                    for r in ratios.iter_mut() {
+                                        *r /= sum;
+                                    }
+                                }
+
+                                ws.stack_ratios = ratios;
+                            }
+                        }
+
+                        let _ = ws;
+                        state.recalculate_layout();
+                        state.needs_redraw = true;
+                    }
+                }
+
+                let under = surface_under_pointer(state, pos);
+                let pointer = state.pointer.clone();
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = event.time_msec();
+                pointer.motion(
+                    state,
+                    under,
+                    &MotionEvent {
+                        location: pos,
+                        serial,
+                        time,
+                    },
+                );
+                pointer.frame(state);
+                return;
+            }
+
+            // ── Normal (no-grab) pointer motion ──
             let under = surface_under_pointer(state, pos);
 
-            // Sloppy focus: when the pointer enters a window surface,
-            // focus it. In Monocle mode we go through focus_window()
-            // which also raises + retiles so the correct window is
-            // brought to the front.
-            if let Some((ref surface, _)) = under {
-                let ws = &state.workspaces[state.active_workspace];
-                let is_monocle = ws.layout == LayoutType::Monocle;
+            // NEVER steal keyboard focus from a layer surface via
+            // pointer hover. The layer surface keeps focus until it
+            // is dismissed or destroyed.
+            if !state.layer_has_keyboard_focus() {
+                if let Some((ref surface, _)) = under {
+                    let ws = &state.workspaces[state.active_workspace];
+                    let is_monocle = ws.layout == LayoutType::Monocle;
 
-                // Find the Window object that owns this surface.
-                let target_window = ws.windows.iter().find(|w| {
-                    w.toplevel().map(|t| t.wl_surface()) == Some(surface)
-                }).cloned();
+                    let target_window = ws.windows.iter().find(|w| {
+                        w.toplevel().map(|t| t.wl_surface()) == Some(surface)
+                    }).cloned();
 
-                if let Some(window) = target_window {
-                    let keyboard = state.keyboard.clone();
-                    if keyboard.current_focus().as_ref() != Some(surface) {
-                        if is_monocle {
-                            // focus_window handles set_focus + raise +
-                            // retile in one shot.
-                            state.focus_window(&window);
-                        } else {
-                            let serial = SERIAL_COUNTER.next_serial();
-                            keyboard.set_focus(state, Some(surface.clone()), serial);
+                    if let Some(window) = target_window {
+                        let keyboard = state.keyboard.clone();
+                        if keyboard.current_focus().as_ref() != Some(surface) {
+                            if is_monocle {
+                                state.focus_window(&window);
+                            } else {
+                                let serial = SERIAL_COUNTER.next_serial();
+                                keyboard.set_focus(state, Some(surface.clone()), serial);
+                            }
                         }
                     }
                 }
@@ -276,13 +496,267 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             let serial = SERIAL_COUNTER.next_serial();
             let time = event.time_msec();
 
-            if button_state == ButtonState::Pressed {
-                let pos = state.pointer_location;
-                let ws = &state.workspaces[state.active_workspace];
-                let hit = ws.space.element_under(pos).map(|(w, _)| w.clone());
-                if let Some(window) = hit {
-                    // focus_window handles raise + Monocle retile.
-                    state.focus_window(&window);
+            // ── Button release: finalise any active grab ──
+            if button_state == ButtonState::Released {
+                if let Some(grab) = state.pointer_grab.take() {
+                    debug!(mode = ?grab.mode, "pointer grab released");
+
+                    match grab.mode {
+                        GrabMode::TiledMove => {
+                            let pos = state.pointer_location;
+                            let ws = &state.workspaces[state.active_workspace];
+                            let drop_target = ws
+                                .space
+                                .element_under(pos)
+                                .map(|(w, _)| w.clone());
+
+                            if let Some(target) = drop_target {
+                                if target != grab
+                                    .window
+                                    && !ws.floating.contains(&target)
+                                    && !ws.floating.contains(&grab.window)
+                                {
+                                    let idx_a = ws
+                                        .windows
+                                        .iter()
+                                        .position(|w| w == &grab.window);
+                                    let idx_b = ws
+                                        .windows
+                                        .iter()
+                                        .position(|w| w == &target);
+                                    if let (Some(a), Some(b)) = (idx_a, idx_b) {
+                                        info!(
+                                            from = a,
+                                            to = b,
+                                            "drag-to-swap: swapping windows"
+                                        );
+                                        state.swap_windows(a, b);
+                                    }
+                                }
+                            }
+                        }
+                        GrabMode::TiledResize => {
+                            state.recalculate_layout();
+                        }
+                        GrabMode::FloatingResize => {
+                            state.recalculate_layout();
+                        }
+                        GrabMode::FloatingMove => {}
+                    }
+                    state.needs_redraw = true;
+                }
+
+                let pointer = state.pointer.clone();
+                pointer.button(
+                    state,
+                    &ButtonEvent {
+                        button,
+                        state: button_state,
+                        serial,
+                        time,
+                    },
+                );
+                pointer.frame(state);
+                return;
+            }
+
+            // ── Button press ──
+            let pos = state.pointer_location;
+            let hit = hit_test_window(state, pos);
+
+            let keyboard = state.keyboard.clone();
+            let super_held = keyboard.modifier_state().logo;
+
+            if super_held {
+                if let Some(window) = hit.clone() {
+                    let is_floating = {
+                        let ws = &state.workspaces[state.active_workspace];
+                        ws.floating.contains(&window)
+                    };
+
+                    if is_floating {
+                        let grab_mode = match button {
+                            BTN_LEFT  => Some(GrabMode::FloatingMove),
+                            BTN_RIGHT => Some(GrabMode::FloatingResize),
+                            _ => None,
+                        };
+
+                        if let Some(mode) = grab_mode {
+                            state.focus_window(&window);
+
+                            let ws = &state.workspaces[state.active_workspace];
+                            let geo = ws
+                                .floating_geo
+                                .get(&window)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    let loc = ws
+                                        .space
+                                        .element_location(&window)
+                                        .unwrap_or_else(|| Point::from((100, 100)));
+                                    let size = window.geometry().size;
+                                    let size = if size.w > 0 && size.h > 0 {
+                                        size
+                                    } else {
+                                        Size::from((640, 480))
+                                    };
+                                    Rectangle::new(loc, size)
+                                });
+
+                            info!(?mode, ?geo, "starting floating grab");
+
+                            state.pointer_grab = Some(GrabState {
+                                mode,
+                                window: window.clone(),
+                                start_pointer: pos,
+                                start_geo: geo,
+                                start_split_ratio: 0.5,
+                                start_stack_ratios: Vec::new(),
+                                screen_width: 0,
+                                screen_height: 0,
+                                tiled_index: 0,
+                                tiled_count: 0,
+                            });
+
+                            let pointer = state.pointer.clone();
+                            pointer.frame(state);
+                            return;
+                        }
+                    } else {
+                        let grab_mode = match button {
+                            BTN_LEFT  => Some(GrabMode::TiledMove),
+                            BTN_RIGHT => Some(GrabMode::TiledResize),
+                            _ => None,
+                        };
+
+                        if let Some(mode) = grab_mode {
+                            state.focus_window(&window);
+
+                            let ws = &mut state.workspaces[state.active_workspace];
+
+                            ws.ensure_stack_ratios();
+                            ws.normalise_stack_ratios();
+
+                            let split_ratio = ws.split_ratio;
+                            let stack_ratios = ws.stack_ratios.clone();
+                            let tiled = ws.tiled_windows();
+                            let tiled_count = tiled.len();
+                            let tiled_index = tiled
+                                .iter()
+                                .position(|w| w == &window)
+                                .unwrap_or(0);
+
+                            let (screen_w, screen_h) = usable_screen_dimensions(state);
+
+                            let ws = &state.workspaces[state.active_workspace];
+                            let loc = ws
+                                .space
+                                .element_location(&window)
+                                .unwrap_or_else(|| Point::from((0, 0)));
+                            let size = window_current_size(&window)
+                                .unwrap_or_else(|| Size::from((640, 480)));
+                            let geo = Rectangle::new(loc, size);
+
+                            info!(
+                                ?mode,
+                                ?geo,
+                                split_ratio,
+                                tiled_index,
+                                tiled_count,
+                                screen_w,
+                                screen_h,
+                                "starting tiled grab"
+                            );
+
+                            state.pointer_grab = Some(GrabState {
+                                mode,
+                                window: window.clone(),
+                                start_pointer: pos,
+                                start_geo: geo,
+                                start_split_ratio: split_ratio,
+                                start_stack_ratios: stack_ratios,
+                                screen_width: screen_w,
+                                screen_height: screen_h,
+                                tiled_index,
+                                tiled_count,
+                            });
+
+                            let pointer = state.pointer.clone();
+                            pointer.frame(state);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Normal click — focus the window, or an interactive layer surface.
+            // Never steal focus from a layer surface on a normal click on a
+            // window behind it.
+            if state.layer_has_keyboard_focus() {
+                // Layer surface has focus — only allow clicks on the layer
+                // surface itself to go through, don't change keyboard focus.
+                if let Some((clicked, _)) = surface_under_pointer(state, pos) {
+                    let mut root = clicked;
+                    while let Some(parent) = get_parent(&root) {
+                        root = parent;
+                    }
+                    let is_layer = {
+                        let map = layer_map_for_output(&state.output);
+                        map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL).is_some()
+                    };
+                    if !is_layer {
+                        // Clicked outside the layer surface — dismiss it
+                        // and focus the window underneath.
+                        if let Some(focused) = state.keyboard.current_focus() {
+                            if let Some(layer) = state.layer_surface_of(&focused) {
+                                info!("click outside layer surface — closing it");
+                                layer.layer_surface().send_close();
+                            }
+                        }
+                        state.drop_focus_to_active_window();
+                        if let Some(window) = hit {
+                            state.focus_window(&window);
+                        }
+                    }
+                }
+            } else if let Some(window) = hit {
+                state.focus_window(&window);
+            } else if let Some((clicked, _)) = surface_under_pointer(state, pos) {
+                let mut root = clicked;
+                while let Some(parent) = get_parent(&root) {
+                    root = parent;
+                }
+                let interactive = {
+                    let map = layer_map_for_output(&state.output);
+                    map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                        .map(|l| l.can_receive_keyboard_focus())
+                        .unwrap_or(false)
+                };
+                if interactive {
+                    let keyboard = state.keyboard.clone();
+                    if keyboard.current_focus().as_ref() != Some(&root) {
+                        let focus_serial = SERIAL_COUNTER.next_serial();
+                        keyboard.set_focus(state, Some(root), focus_serial);
+                    }
+                }
+            } else {
+                let keyboard = state.keyboard.clone();
+                let focus_is_layer = keyboard.current_focus().map(|s| {
+                    let mut root = s;
+                    while let Some(parent) = get_parent(&root) {
+                        root = parent;
+                    }
+                    let map = layer_map_for_output(&state.output);
+                    map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL).is_some()
+                }).unwrap_or(false);
+                if focus_is_layer {
+                    let fallback = state.workspaces[state.active_workspace]
+                        .windows
+                        .last()
+                        .and_then(|w| w.toplevel())
+                        .map(|t| t.wl_surface().clone());
+                    let focus_serial = SERIAL_COUNTER.next_serial();
+                    keyboard.set_focus(state, fallback, focus_serial);
                 }
             }
 
@@ -384,6 +858,106 @@ fn surface_under_pointer(
     None
 }
 
+fn spawn_launcher(command: &str) {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        warn!("config: launcher is empty, nothing to spawn");
+        return;
+    }
+    info!(command = trimmed, "spawning launcher");
+
+    match Command::new("sh")
+        .arg("-c")
+        .arg(trimmed)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => {
+            let pid = child.id();
+            debug!(pid, command = trimmed, "launcher spawned");
+            let command_owned = trimmed.to_string();
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                match child.wait_with_output() {
+                    Ok(output) if !output.status.success() => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let elapsed = t0.elapsed();
+                        warn!(
+                            pid,
+                            command = %command_owned,
+                            exit_code = ?output.status.code(),
+                            stderr = %stderr.trim(),
+                            "launcher exited with error"
+                        );
+
+                        if elapsed < Duration::from_millis(500) {
+                            let retry_cmd = build_config_bypass(&command_owned);
+                            if retry_cmd != command_owned {
+                                warn!(
+                                    retry = %retry_cmd,
+                                    "launcher failed quickly — retrying without user config"
+                                );
+                                match Command::new("sh")
+                                    .arg("-c")
+                                    .arg(&retry_cmd)
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn()
+                                {
+                                    Ok(retry_child) => {
+                                        info!(
+                                            pid = retry_child.id(),
+                                            command = %retry_cmd,
+                                            "launcher retry spawned"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            ?err,
+                                            command = %retry_cmd,
+                                            "launcher retry also failed to spawn"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        debug!(pid, command = %command_owned, "launcher exited");
+                    }
+                    Err(err) => warn!(pid, command = %command_owned, ?err, "wait failed"),
+                }
+            });
+        }
+        Err(err) => warn!(?err, command = trimmed, "failed to spawn launcher"),
+    }
+}
+
+fn build_config_bypass(original: &str) -> String {
+    let base = original.split_whitespace().next().unwrap_or("");
+
+    if base.ends_with("fuzzel") || base == "fuzzel" {
+        if !original.contains("--config") && !original.contains("-C") {
+            return format!("{} --config /dev/null", original);
+        }
+    }
+
+    if base.ends_with("wofi") || base == "wofi" {
+        if !original.contains("--conf") {
+            return format!("{} --conf /dev/null", original);
+        }
+    }
+
+    if base.ends_with("rofi") || base == "rofi" {
+        if !original.contains("-no-config") {
+            return format!("{} -no-config", original);
+        }
+    }
+
+    original.to_string()
+}
+
 fn spawn_terminal(command: &str) {
     let mut parts = command.split_whitespace();
     let Some(program) = parts.next() else {
@@ -408,7 +982,7 @@ fn spawn_terminal(command: &str) {
                 match child.wait_with_output() {
                     Ok(output) => {
                         let stderr = String::from_utf8_lossy(&output.stderr);
-                        let stdout = String::from_utf8_lossy(&output.stdout);
+                                                let stdout = String::from_utf8_lossy(&output.stdout);
                         if output.status.success() {
                             debug!(
                                 pid,
