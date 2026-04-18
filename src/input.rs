@@ -4,8 +4,6 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-
-
 use smithay::{
     backend::{
         input::{
@@ -39,7 +37,7 @@ pub enum KeyAction {
     SpawnLauncher,
     CloseFocused,
     ToggleFullscreen,
-    ToggleFloating,
+    CycleLayout,
     FocusLeft,
     FocusRight,
     MoveWindowLeft,
@@ -118,7 +116,7 @@ fn handle_keybinding(
             s if s == Keysym::f || s == Keysym::F    => KeyAction::ToggleFullscreen,
             s if s == Keysym::t || s == Keysym::T    => KeyAction::CycleTheme,
             s if s == Keysym::b || s == Keysym::B    => KeyAction::ToggleNavbar,
-            Keysym::space                            => KeyAction::ToggleFloating,
+            Keysym::space                            => KeyAction::CycleLayout,
             Keysym::Left                             => KeyAction::FocusLeft,
             Keysym::Right                            => KeyAction::FocusRight,
             _ => {
@@ -155,14 +153,14 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         KeyAction::ToggleFullscreen => {
             info!("Action ToggleFullscreen not yet implemented");
         }
-        KeyAction::ToggleFloating => {
-            info!("Action ToggleFloating not yet implemented");
+        KeyAction::CycleLayout => {
+            state.cycle_layout();
         }
         KeyAction::MoveWindowLeft => {
-            info!("Action MoveWindow not yet implemented");
+            info!("Action MoveWindowLeft not yet implemented");
         }
         KeyAction::MoveWindowRight => {
-            info!("Action MoveWindow not yet implemented");
+            info!("Action MoveWindowRight not yet implemented");
         }
         KeyAction::SwitchWorkspace(idx) => {
             state.switch_workspace(idx);
@@ -379,7 +377,6 @@ fn spawn_terminal(command: &str) {
     let args: Vec<&str> = parts.collect();
     info!(program, ?args, "spawning terminal");
 
-    // Capture stderr via pipe so we can log why the client crashes
     match Command::new(program)
         .args(&args)
         .stdout(std::process::Stdio::piped())
@@ -390,7 +387,6 @@ fn spawn_terminal(command: &str) {
             let pid = child.id();
             debug!(pid, program, "terminal spawned");
 
-            // Spawn a thread to wait for the child and log its exit + stderr
             let program_owned = program.to_string();
             std::thread::spawn(move || {
                 match child.wait_with_output() {

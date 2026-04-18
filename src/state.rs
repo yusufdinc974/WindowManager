@@ -46,6 +46,7 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::layout::LayoutType;
 
 pub const CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
 pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
@@ -60,10 +61,10 @@ pub struct Workspace {
     pub windows: Vec<Window>,
     pub spawn_times: HashMap<Window, Instant>,
     /// Tracks the last configure size sent to each window so we only
-    /// send a new configure when the size actually changes. This
-    /// prevents the animation loop from flooding clients with
-    /// configure events.
+    /// send a new configure when the size actually changes.
     pub configured_sizes: HashMap<Window, (i32, i32)>,
+    /// The active tiling layout for this workspace.
+    pub layout: LayoutType,
 }
 
 impl Workspace {
@@ -75,6 +76,7 @@ impl Workspace {
             windows: Vec::new(),
             spawn_times: HashMap::new(),
             configured_sizes: HashMap::new(),
+            layout: LayoutType::default(),
         }
     }
 }
@@ -191,6 +193,16 @@ impl State {
     pub fn focus_window(&mut self, window: &Window) {
         let ws = &mut self.workspaces[self.active_workspace];
         ws.space.raise_element(window, true);
+
+        // In Monocle mode, move the focused window to the end of the
+        // window list so it is the one that gets raised on next retile.
+        if ws.layout == LayoutType::Monocle {
+            if let Some(pos) = ws.windows.iter().position(|w| w == window) {
+                let w = ws.windows.remove(pos);
+                ws.windows.push(w);
+            }
+        }
+
         let surface = window
             .toplevel()
             .map(|t| t.wl_surface().clone());
@@ -236,7 +248,7 @@ impl State {
 
         let next_focus = self.workspaces[self.active_workspace]
             .windows
-            .first()
+            .last()
             .and_then(|w| w.toplevel())
             .map(|t| t.wl_surface().clone());
         let serial = SERIAL_COUNTER.next_serial();
@@ -264,6 +276,13 @@ impl State {
         };
         let next = ws.windows[next_idx].clone();
         self.focus_window(&next);
+
+        // In Monocle mode, retile so the newly focused window is raised.
+        if self.workspaces[self.active_workspace].layout == LayoutType::Monocle {
+            self.recalculate_layout();
+        }
+
+        self.needs_redraw = true;
     }
 
     pub fn switch_workspace(&mut self, idx: usize) {
@@ -279,6 +298,7 @@ impl State {
         info!(
             from = self.active_workspace + 1,
             to = idx + 1,
+            layout = %self.workspaces[idx].layout,
             "switching workspace"
         );
 
