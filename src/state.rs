@@ -1,11 +1,10 @@
-//! Core compositor state types.
-//!
-//! Extracted from `main.rs` during Phase 10 (The Grand Refactoring).
-//! This module contains only type definitions and trivial constructors —
-//! the actual wiring (protocol globals, event sources, DRM bringup) still
-//! lives in `main.rs` and `backend.rs`.
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    time::{Duration, Instant},
+};
 
-use std::{collections::HashSet, ffi::OsString, time::Instant};
+use mlua::Lua;
 
 use smithay::{
     backend::{
@@ -46,8 +45,11 @@ use smithay::{
 };
 use tracing::{debug, info, warn};
 
+use crate::config::Config;
+
 pub const CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
-pub const NUM_WORKSPACES: usize = 9;
+pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
+pub const ANIMATION_START_SCALE: f32 = 0.8;
 
 // -------------------------------------------------------------------------
 // Workspace
@@ -56,6 +58,12 @@ pub const NUM_WORKSPACES: usize = 9;
 pub struct Workspace {
     pub space: Space<Window>,
     pub windows: Vec<Window>,
+    pub spawn_times: HashMap<Window, Instant>,
+    /// Tracks the last configure size sent to each window so we only
+    /// send a new configure when the size actually changes. This
+    /// prevents the animation loop from flooding clients with
+    /// configure events.
+    pub configured_sizes: HashMap<Window, (i32, i32)>,
 }
 
 impl Workspace {
@@ -65,8 +73,29 @@ impl Workspace {
         Self {
             space,
             windows: Vec::new(),
+            spawn_times: HashMap::new(),
+            configured_sizes: HashMap::new(),
         }
     }
+}
+
+pub fn animation_progress(now: Instant, spawn_time: Instant) -> Option<f32> {
+    let elapsed = now.saturating_duration_since(spawn_time);
+    if elapsed >= ANIMATION_DURATION {
+        return None;
+    }
+    let t = elapsed.as_secs_f32() / ANIMATION_DURATION.as_secs_f32();
+    let eased = 1.0 - (1.0 - t).powi(3);
+    Some(eased.clamp(0.0, 1.0))
+}
+
+pub fn animation_scale(progress: f32) -> f32 {
+    ANIMATION_START_SCALE + (1.0 - ANIMATION_START_SCALE) * progress
+}
+
+#[allow(dead_code)]
+pub fn animation_alpha(progress: f32) -> f32 {
+    progress.clamp(0.0, 1.0)
 }
 
 // -------------------------------------------------------------------------
@@ -93,11 +122,7 @@ pub struct State {
     pub pointer: PointerHandle<Self>,
     pub pointer_location: Point<f64, Logical>,
 
-    /// Latest cursor-image request from the focused client
-    /// (CursorImageStatus::Default if no client has set one).
     pub cursor_status: CursorImageStatus,
-    /// Fallback cursor: a small solid-colour square drawn at
-    /// `pointer_location` on top of everything else.
     pub cursor_buffer: SolidColorBuffer,
 
     pub workspaces: Vec<Workspace>,
@@ -105,9 +130,14 @@ pub struct State {
     pub output: Output,
     pub popups: PopupManager,
 
-    /// Set to true whenever the scene changes and a new frame should
-    /// be rendered.
+    pub config: Config,
+    pub lua: Lua,
+
     pub needs_redraw: bool,
+
+    /// The GLES renderer. Lives here so DmabufHandler can import
+    /// buffers synchronously.
+    pub renderer: GlesRenderer,
 }
 
 #[derive(Default)]
@@ -116,8 +146,12 @@ pub struct ClientState {
 }
 
 impl ClientData for ClientState {
-    fn initialized(&self, _client_id: ClientId) {}
-    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    fn initialized(&self, client_id: ClientId) {
+        tracing::info!(?client_id, "wayland client initialized");
+    }
+    fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
+        tracing::warn!(?client_id, ?reason, "wayland client DISCONNECTED");
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -134,11 +168,9 @@ pub type WmDrmCompositor = DrmCompositor<
 pub struct DrmBackend {
     #[allow(dead_code)]
     pub drm_node: DrmNode,
-    pub renderer: GlesRenderer,
     pub compositor: WmDrmCompositor,
     pub crtc: crtc::Handle,
     pub frame_sent: HashSet<WlSurface>,
-    /// True when a frame has been queued but VBlank hasn't fired yet.
     pub pending_frame: bool,
 }
 
@@ -152,7 +184,7 @@ pub struct CalloopData {
 }
 
 // -------------------------------------------------------------------------
-// Workspace / focus operations (inherent methods on State)
+// Workspace / focus operations
 // -------------------------------------------------------------------------
 
 impl State {
@@ -183,15 +215,23 @@ impl State {
             return;
         };
         let window = ws.windows.remove(idx);
+        ws.spawn_times.remove(&window);
+        ws.configured_sizes.remove(&window);
         if let Some(toplevel) = window.toplevel() {
             toplevel.send_close();
         }
         ws.space.unmap_elem(&window);
 
         let output = self.output.clone();
+        let outer = self.config.outer_gaps;
+        let inner = self.config.inner_gaps;
+        let border = self.config.border_width;
         Self::recalculate_layout_for(
             &mut self.workspaces[self.active_workspace],
             &output,
+            outer,
+            inner,
+            border,
         );
 
         let next_focus = self.workspaces[self.active_workspace]
@@ -226,8 +266,6 @@ impl State {
         self.focus_window(&next);
     }
 
-    // ── Workspace operations ────────────────────────────────────────
-
     pub fn switch_workspace(&mut self, idx: usize) {
         if idx >= self.workspaces.len() {
             warn!(idx, "switch_workspace: index out of range");
@@ -246,7 +284,6 @@ impl State {
 
         self.active_workspace = idx;
 
-        // Update keyboard focus to whatever is on top of the new workspace.
         let focus = self.workspaces[self.active_workspace]
             .windows
             .last()
@@ -279,7 +316,6 @@ impl State {
 
         let src_idx = self.active_workspace;
 
-        // Find the window in the source workspace.
         let src_ws = &mut self.workspaces[src_idx];
         let Some(win_idx) = src_ws
             .windows
@@ -291,6 +327,8 @@ impl State {
         };
 
         let window = src_ws.windows.remove(win_idx);
+        let spawn_time = src_ws.spawn_times.remove(&window);
+        let configured_size = src_ws.configured_sizes.remove(&window);
         src_ws.space.unmap_elem(&window);
 
         info!(
@@ -299,22 +337,34 @@ impl State {
             "moving window to workspace"
         );
 
-        // Add to target workspace.
         let dst_ws = &mut self.workspaces[target_idx];
+        if let Some(t) = spawn_time {
+            dst_ws.spawn_times.insert(window.clone(), t);
+        }
+        if let Some(sz) = configured_size {
+            dst_ws.configured_sizes.insert(window.clone(), sz);
+        }
         dst_ws.windows.push(window);
 
-        // Recalculate layout for both workspaces.
         let output = self.output.clone();
+        let outer = self.config.outer_gaps;
+        let inner = self.config.inner_gaps;
+        let border = self.config.border_width;
         Self::recalculate_layout_for(
             &mut self.workspaces[src_idx],
             &output,
+            outer,
+            inner,
+            border,
         );
         Self::recalculate_layout_for(
             &mut self.workspaces[target_idx],
             &output,
+            outer,
+            inner,
+            border,
         );
 
-        // Update focus on the source (active) workspace.
         let next_focus = self.workspaces[src_idx]
             .windows
             .last()
@@ -324,6 +374,45 @@ impl State {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, next_focus, serial);
 
+        self.needs_redraw = true;
+    }
+
+    pub fn any_animating(&self) -> bool {
+        let now = Instant::now();
+        self.workspaces.iter().any(|ws| {
+            ws.spawn_times
+                .values()
+                .any(|t| animation_progress(now, *t).is_some())
+        })
+    }
+
+    pub fn cycle_theme(&mut self) {
+        let call = self.lua.load(
+            "if type(cycle_theme) == 'function' then cycle_theme() \
+             else print('rc.lua: cycle_theme is not defined') end",
+        );
+        if let Err(err) = call.exec() {
+            warn!(error = %err, "cycle_theme: Lua execution failed");
+            return;
+        }
+        self.config.refresh_from_lua(&self.lua);
+        info!(
+            active = %self.config.active_border_color,
+            inactive = %self.config.inactive_border_color,
+            "theme refreshed from Lua"
+        );
+        self.needs_redraw = true;
+    }
+
+    pub fn toggle_navbar(&mut self) {
+        let call = self.lua.load(
+            "if type(toggle_navbar) == 'function' then toggle_navbar() \
+             else print('rc.lua: toggle_navbar is not defined') end",
+        );
+        if let Err(err) = call.exec() {
+            warn!(error = %err, "toggle_navbar: Lua execution failed");
+            return;
+        }
         self.needs_redraw = true;
     }
 }

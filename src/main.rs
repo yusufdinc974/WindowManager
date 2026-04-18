@@ -1,10 +1,4 @@
 //! Phase 10: bare-metal Wayland compositor entry point.
-//!
-//! After the Grand Refactoring `main.rs` only hosts:
-//!   * module declarations,
-//!   * the DRM/udev/libseat backend bringup,
-//!   * `render_frame` / `handle_drm_event`,
-//!   * the `main()` function and its calloop event loop.
 
 use std::{
     collections::HashSet,
@@ -76,23 +70,17 @@ use smithay::{
 };
 use tracing::{info, trace, warn};
 
-// -------------------------------------------------------------------------
-// Extracted modules (Phase 10)
-// -------------------------------------------------------------------------
-
+mod config;
 mod handlers;
 mod input;
 mod layout;
 mod state;
 
+use config::Config;
 use input::{handle_ipc_command, handle_libinput_event, IpcCommand};
 use state::{
-    CalloopData, ClientState, DrmBackend, State, Workspace, CLEAR_COLOR, NUM_WORKSPACES,
+    CalloopData, ClientState, DrmBackend, State, Workspace, CLEAR_COLOR,
 };
-
-// -------------------------------------------------------------------------
-// Entry point
-// -------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -104,23 +92,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("bootstrapping bare-metal Wayland compositor (Phase 10)");
 
+    let (lua, config) = Config::load_from_lua();
+    info!(
+        terminal = %config.terminal,
+        outer = config.outer_gaps,
+        inner = config.inner_gaps,
+        border = config.border_width,
+        active_border = %config.active_border_color,
+        inactive_border = %config.inactive_border_color,
+        workspaces = config.workspace_count(),
+        "config: active values"
+    );
+
     let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
     let loop_signal = event_loop.get_signal();
 
     let display: Display<State> = Display::new()?;
     let display_handle = display.handle();
 
-    // ---- Libseat session ----------------------------------------------
     let (mut session, session_notifier) = LibSeatSession::new()
         .map_err(|e| format!("failed to open libseat session: {e:?}"))?;
     info!(seat = %session.seat(), "libseat session opened");
 
-    // ---- DRM backend ---------------------------------------------------
-    let (drm_backend, output, drm_notifier) =
+    let (drm_backend, renderer, output, drm_notifier) =
         init_drm_backend(&mut session, &display_handle)?;
     info!("DRM backend ready");
 
-    // ---- linux_dmabuf global with device feedback ---------------------
     let render_node = drm_backend
         .drm_node
         .node_with_type(NodeType::Render)
@@ -128,8 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(drm_backend.drm_node);
     info!(?render_node, "resolved render node for dmabuf feedback");
 
-    let dmabuf_formats = drm_backend
-        .renderer
+    let dmabuf_formats = renderer
         .egl_context()
         .dmabuf_render_formats()
         .clone();
@@ -148,7 +144,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("linux_dmabuf global registered with render node feedback");
 
-    // ---- Protocol globals ---------------------------------------------
     let compositor_state = CompositorState::new::<State>(&display_handle);
     let xdg_shell_state = XdgShellState::new::<State>(&display_handle);
     let xdg_decoration_state = XdgDecorationState::new::<State>(&display_handle);
@@ -157,7 +152,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_manager_state =
         OutputManagerState::new_with_xdg_output::<State>(&display_handle);
 
-    // ---- Seat ---------------------------------------------------------
     let mut seat_state: SeatState<State> = SeatState::new();
     let mut seat: Seat<State> =
         seat_state.new_wl_seat(&display_handle, "seat0");
@@ -168,13 +162,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("seat 'seat0' initialised with keyboard + pointer capabilities");
 
-    // ---- Workspaces ---------------------------------------------------
-    let workspaces: Vec<Workspace> = (0..NUM_WORKSPACES)
+    let workspace_count = config.workspace_count().max(1);
+    let workspaces: Vec<Workspace> = (0..workspace_count)
         .map(|_| Workspace::new(&output))
         .collect();
-    info!(count = NUM_WORKSPACES, "workspaces initialised");
+    info!(count = workspace_count, "workspaces initialised");
 
-    // ---- Wayland listening socket ------------------------------------
     let listening_socket = ListeningSocketSource::new_auto()?;
     let socket_name = listening_socket.socket_name().to_os_string();
     info!(?socket_name, "listening for wayland clients");
@@ -197,14 +190,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match unsafe { display.get_mut().dispatch_clients(&mut data.state) } {
                 Ok(_) => Ok(PostAction::Continue),
                 Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+                    warn!("dispatch_clients: BrokenPipe (client disconnected)");
                     Ok(PostAction::Continue)
                 }
-                Err(err) => Err(std::io::Error::other(err)),
+                Err(err) => {
+                    warn!(?err, "dispatch_clients: fatal error");
+                    Err(std::io::Error::other(err))
+                }
             }
         },
     )?;
 
-    // ---- IPC socket ---------------------------------------------------
     let ipc_socket_path = "/tmp/mywm.sock";
     let _ = std::fs::remove_file(ipc_socket_path);
     let ipc_listener = UnixListener::bind(ipc_socket_path)?;
@@ -265,7 +261,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    // ---- Libinput input backend ---------------------------------------
     let seat_name = session.seat();
     let mut libinput_context = Libinput::new_with_udev::<
         LibinputSessionInterface<LibSeatSession>,
@@ -281,7 +276,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     info!("libinput event source registered");
 
-    // ---- Session notifier ---------------------------------------------
     event_loop.handle().insert_source(session_notifier, {
         let mut libinput_context = libinput_context.clone();
         move |event, &mut (), data: &mut CalloopData| match event {
@@ -304,7 +298,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    // ---- udev hotplug watcher ----------------------------------------
     let udev_backend = UdevBackend::new(&seat_name)
         .map_err(|e| format!("failed to create udev backend: {e:?}"))?;
     event_loop.handle().insert_source(udev_backend, |event, _, _data| {
@@ -321,7 +314,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    // ---- DRM notifier (VBlank → render) -------------------------------
     let drm_token: RegistrationToken = event_loop.handle().insert_source(
         drm_notifier,
         |event, _meta, data| {
@@ -329,7 +321,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    // ---- Environment for spawned children ----------------------------
     std::env::set_var("WAYLAND_DISPLAY", &socket_name);
     std::env::set_var("XDG_SESSION_TYPE", "wayland");
     std::env::remove_var("DISPLAY");
@@ -341,7 +332,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "environment variables set for child processes"
     );
 
-    // ---- Assemble state ----------------------------------------------
+    {
+        let autostart_result: Result<mlua::Value, _> =
+            lua.load("return wm.autostart").eval();
+        if let Ok(mlua::Value::Table(cmds)) = autostart_result {
+            for cmd in cmds.sequence_values::<String>().flatten() {
+                info!(command = %cmd, "autostart: launching");
+                match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(child) => info!(pid = child.id(), "autostart: process spawned"),
+                    Err(err) => warn!(?err, %cmd, "autostart: failed to spawn"),
+                }
+            }
+        }
+    }
+
     let state = State {
         start_time: std::time::Instant::now(),
         display_handle,
@@ -365,7 +375,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         active_workspace: 0,
         output,
         popups: PopupManager::default(),
+        config,
+        lua,
         needs_redraw: true,
+        renderer,
     };
 
     let mut data = CalloopData {
@@ -394,8 +407,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ws.space.refresh();
             data.state.popups.cleanup();
 
-            // If the VBlank-driven render loop has stopped (no pending
-            // frame) and something has changed, kick off a new render.
+            if data.state.any_animating() {
+                data.state.recalculate_layout();
+                data.state.needs_redraw = true;
+            }
+
             if data.state.needs_redraw && !data.backend.pending_frame {
                 render_frame(data);
             }
@@ -404,7 +420,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("event loop exited, shutting down");
 
-    // ---- Graceful shutdown with correct drop ordering -----------------
     drop(data.backend);
     event_loop.handle().remove(drm_token);
     drop(data.state);
@@ -418,7 +433,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // -------------------------------------------------------------------------
-// DRM backend
+// DRM backend — renderer is returned separately, goes into State
 // -------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -449,6 +464,7 @@ fn init_drm_backend(
 ) -> Result<
     (
         DrmBackend,
+        GlesRenderer,
         Output,
         smithay::backend::drm::DrmDeviceNotifier,
     ),
@@ -600,19 +616,15 @@ fn init_drm_backend(
 
     let backend = DrmBackend {
         drm_node,
-        renderer,
         compositor,
         crtc,
         frame_sent: HashSet::new(),
         pending_frame: false,
     };
 
-    Ok((backend, output, drm_notifier))
+    Ok((backend, renderer, output, drm_notifier))
 }
 
-// A single render element on the output is either a surface the Space
-// wants drawn (windows + layer-shell surfaces) or our solid-colour
-// fallback cursor sprite, composited on top.
 smithay::backend::renderer::element::render_elements! {
     OutputRenderElements<=GlesRenderer>;
     Space = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
@@ -622,7 +634,6 @@ smithay::backend::renderer::element::render_elements! {
 fn render_frame(data: &mut CalloopData) {
     let CalloopData { state, backend } = data;
 
-    // Don't try to render if a frame is already in-flight.
     if backend.pending_frame {
         return;
     }
@@ -630,7 +641,7 @@ fn render_frame(data: &mut CalloopData) {
     let active_space = &state.workspaces[state.active_workspace].space;
     let spaces = [active_space];
     let space_elements = match space_render_elements(
-        &mut backend.renderer,
+        &mut state.renderer,
         spaces,
         &state.output,
         1.0,
@@ -642,13 +653,9 @@ fn render_frame(data: &mut CalloopData) {
         }
     };
 
-    // Build the final element list: cursor first (top of Z-order), then
-    // every space element underneath it.
     let mut wrapped: Vec<OutputRenderElements> =
         Vec::with_capacity(space_elements.len() + 1);
 
-    // The cursor lives in logical coords; convert to physical (scale=1
-    // for now since we set Scale::Integer(1) on the output).
     let cursor_loc = state.pointer_location.to_i32_round().to_physical(1);
     let cursor_elem = SolidColorRenderElement::from_buffer(
         &state.cursor_buffer,
@@ -660,12 +667,10 @@ fn render_frame(data: &mut CalloopData) {
     wrapped.push(OutputRenderElements::Cursor(cursor_elem));
     wrapped.extend(space_elements.into_iter().map(OutputRenderElements::Space));
 
-    // Silence unused-warning for cursor_status until we honour
-    // client-provided cursor surfaces.
     let _ = &state.cursor_status;
 
     match backend.compositor.render_frame::<_, _>(
-        &mut backend.renderer,
+        &mut state.renderer,
         &wrapped,
         Color32F::from(CLEAR_COLOR),
         FrameFlags::DEFAULT,
@@ -689,9 +694,6 @@ fn render_frame(data: &mut CalloopData) {
     let now = state.start_time.elapsed();
     let output = state.output.clone();
 
-    // Send frame callbacks to windows on ALL workspaces so that
-    // background clients don't stall waiting for a
-    // wl_callback.done that never arrives.
     for ws in state.workspaces.iter() {
         ws.space.elements().for_each(|window| {
             window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
@@ -729,10 +731,6 @@ fn handle_drm_event(event: DrmEvent, data: &mut CalloopData) {
         }
     }
 }
-
-// -------------------------------------------------------------------------
-// Helpers
-// -------------------------------------------------------------------------
 
 #[allow(dead_code)]
 fn surface_under(

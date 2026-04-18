@@ -1,12 +1,10 @@
 //! Keyboard / pointer routing and IPC command dispatch.
-//!
-//! Extracted from `main.rs` during Phase 10 (The Grand Refactoring).
-//! `KeyAction` and `IpcCommand` live here (moved from `state.rs` — they're
-//! command types consumed exclusively by this module's dispatchers).
 
 use std::process::Command;
 
 use serde::Deserialize;
+
+
 
 use smithay::{
     backend::{
@@ -48,6 +46,8 @@ pub enum KeyAction {
     MoveWindowRight,
     SwitchWorkspace(usize),
     MoveToWorkspace(usize),
+    CycleTheme,
+    ToggleNavbar,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -61,7 +61,6 @@ pub enum IpcCommand {
 // Keyboard filter
 // -------------------------------------------------------------------------
 
-/// Map a keysym _1 .. _9 to a 0-based workspace index.
 fn keysym_to_workspace_index(sym: Keysym) -> Option<usize> {
     match sym {
         Keysym::_1 => Some(0),
@@ -87,7 +86,6 @@ fn handle_keybinding(
         return FilterResult::Forward;
     }
 
-    // We only handle chords that include Super, with no Ctrl or Alt.
     if !mods.logo || mods.ctrl || mods.alt {
         return FilterResult::Forward;
     }
@@ -95,7 +93,6 @@ fn handle_keybinding(
     let sym = keysym_handle.modified_sym();
 
     let action = if mods.shift {
-        // ── Super + Shift ───────────────────────────────────────────
         debug!(?mods, sym = ?sym, "chord pressed (Super+Shift)");
         match sym {
             Keysym::Escape                          => KeyAction::Quit,
@@ -103,10 +100,6 @@ fn handle_keybinding(
             Keysym::Left                             => KeyAction::MoveWindowLeft,
             Keysym::Right                            => KeyAction::MoveWindowRight,
             _ => {
-                // Super+Shift+[1-9] → MoveToWorkspace
-                // When shift is held, xkb gives us the shifted symbol
-                // (e.g. '!' for Shift+1 on US layout). We need the
-                // *raw* (unshifted) keysym to detect number keys.
                 let raw_sym = keysym_handle.raw_syms().first().copied()
                     .unwrap_or(sym);
                 if let Some(idx) = keysym_to_workspace_index(raw_sym) {
@@ -117,18 +110,18 @@ fn handle_keybinding(
             }
         }
     } else {
-        // ── Super only ──────────────────────────────────────────────
         debug!(?mods, sym = ?sym, "chord pressed (Super)");
         match sym {
             Keysym::Return                           => KeyAction::SpawnTerminal,
             s if s == Keysym::d || s == Keysym::D    => KeyAction::SpawnLauncher,
             s if s == Keysym::q || s == Keysym::Q    => KeyAction::CloseFocused,
             s if s == Keysym::f || s == Keysym::F    => KeyAction::ToggleFullscreen,
+            s if s == Keysym::t || s == Keysym::T    => KeyAction::CycleTheme,
+            s if s == Keysym::b || s == Keysym::B    => KeyAction::ToggleNavbar,
             Keysym::space                            => KeyAction::ToggleFloating,
             Keysym::Left                             => KeyAction::FocusLeft,
             Keysym::Right                            => KeyAction::FocusRight,
             _ => {
-                // Super+[1-9] → SwitchWorkspace
                 if let Some(idx) = keysym_to_workspace_index(sym) {
                     KeyAction::SwitchWorkspace(idx)
                 } else {
@@ -149,7 +142,7 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
             info!("kill switch triggered (Super+Shift+Escape) — stopping");
             state.loop_signal.stop();
         }
-        KeyAction::SpawnTerminal => spawn_terminal(),
+        KeyAction::SpawnTerminal => spawn_terminal(&state.config.terminal),
         KeyAction::CloseFocused => state.close_focused(),
         KeyAction::FocusRight => state.focus_relative(1),
         KeyAction::FocusLeft => state.focus_relative(-1),
@@ -176,6 +169,12 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         }
         KeyAction::MoveToWorkspace(idx) => {
             state.move_to_workspace(idx);
+        }
+        KeyAction::CycleTheme => {
+            state.cycle_theme();
+        }
+        KeyAction::ToggleNavbar => {
+            state.toggle_navbar();
         }
     }
 }
@@ -227,9 +226,6 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             let pos = state.pointer_location;
             let under = surface_under_pointer(state, pos);
 
-            // Sloppy focus: if the pointer is over a tracked toplevel
-            // window, move keyboard focus to it. Layer surfaces (bars,
-            // wallpapers) never steal keyboard focus.
             if let Some((surface, _)) = under.as_ref() {
                 let ws = &state.workspaces[state.active_workspace];
                 let is_window = ws.windows.iter().any(|w| {
@@ -258,8 +254,6 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             );
             pointer.frame(state);
 
-            // Cursor moved on screen — redraw so the cursor sprite
-            // follows.
             state.needs_redraw = true;
         }
 
@@ -269,7 +263,6 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             let serial = SERIAL_COUNTER.next_serial();
             let time = event.time_msec();
 
-            // Click-to-focus: only on press, only for real toplevels.
             if button_state == ButtonState::Pressed {
                 let pos = state.pointer_location;
                 let ws = &state.workspaces[state.active_workspace];
@@ -279,8 +272,6 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
                 }
             }
 
-            // Always route both press and release to the client so it
-            // can complete its own button handling.
             let pointer = state.pointer.clone();
             pointer.button(
                 state,
@@ -317,7 +308,7 @@ pub fn handle_ipc_command(state: &mut State, cmd: IpcCommand) {
         }
         IpcCommand::SpawnTerminal => {
             info!("IPC: spawn terminal");
-            spawn_terminal();
+            spawn_terminal(&state.config.terminal);
         }
         IpcCommand::CloseFocused => {
             info!("IPC: close focused");
@@ -330,20 +321,10 @@ pub fn handle_ipc_command(state: &mut State, cmd: IpcCommand) {
 // Pointer focus lookup
 // -------------------------------------------------------------------------
 
-/// Find the surface directly under `pos` in screen coordinates, preferring
-/// (in z-order, top-first):
-///   1. Overlay / Top layer-shell surfaces (e.g. lock-screen, dropdown menus).
-///   2. The active workspace's window stack.
-///   3. Bottom / Background layer-shell surfaces (e.g. wallpapers).
-///
-/// Returns the surface together with the pointer position translated into
-/// its own local coordinate system — which is exactly what
-/// `PointerHandle::motion` wants as the focus arg.
 fn surface_under_pointer(
     state: &State,
     pos: Point<f64, Logical>,
 ) -> Option<(WlSurface, Point<f64, Logical>)> {
-    // ── 1. Layers above windows ─────────────────────────────────────
     {
         let map = layer_map_for_output(&state.output);
         if let Some(layer) = map
@@ -360,7 +341,6 @@ fn surface_under_pointer(
         }
     }
 
-    // ── 2. Tiled / floating windows on the active workspace ─────────
     let ws = &state.workspaces[state.active_workspace];
     if let Some((window, win_loc)) = ws.space.element_under(pos) {
         let local = pos - win_loc.to_f64();
@@ -371,7 +351,6 @@ fn surface_under_pointer(
         }
     }
 
-    // ── 3. Layers below windows ─────────────────────────────────────
     {
         let map = layer_map_for_output(&state.output);
         if let Some(layer) = map
@@ -391,13 +370,61 @@ fn surface_under_pointer(
     None
 }
 
-fn spawn_terminal() {
-    info!("spawning alacritty");
-    match Command::new("alacritty")
-        .stderr(std::process::Stdio::null())
+fn spawn_terminal(command: &str) {
+    let mut parts = command.split_whitespace();
+    let Some(program) = parts.next() else {
+        warn!("config: terminal_command is empty, nothing to spawn");
+        return;
+    };
+    let args: Vec<&str> = parts.collect();
+    info!(program, ?args, "spawning terminal");
+
+    // Capture stderr via pipe so we can log why the client crashes
+    match Command::new(program)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
     {
-        Ok(child) => debug!(pid = child.id(), "alacritty spawned"),
-        Err(err) => warn!(?err, "failed to spawn alacritty"),
+        Ok(child) => {
+            let pid = child.id();
+            debug!(pid, program, "terminal spawned");
+
+            // Spawn a thread to wait for the child and log its exit + stderr
+            let program_owned = program.to_string();
+            std::thread::spawn(move || {
+                match child.wait_with_output() {
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        if output.status.success() {
+                            debug!(
+                                pid,
+                                program = %program_owned,
+                                "terminal exited successfully"
+                            );
+                        } else {
+                            warn!(
+                                pid,
+                                program = %program_owned,
+                                exit_code = ?output.status.code(),
+                                stderr = %stderr.trim(),
+                                stdout = %stdout.trim(),
+                                "terminal exited with error"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            pid,
+                            program = %program_owned,
+                            ?err,
+                            "failed to wait for terminal process"
+                        );
+                    }
+                }
+            });
+        }
+        Err(err) => warn!(?err, program, "failed to spawn terminal"),
     }
 }
