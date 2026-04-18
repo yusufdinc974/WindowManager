@@ -417,6 +417,17 @@ impl XdgDecorationHandler for State {
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ServerSide);
         });
+
+        let initial_sent = with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .map(|d| d.lock().unwrap().initial_configure_sent)
+                .unwrap_or(false)
+        });
+        if initial_sent {
+            toplevel.send_configure();
+        }
     }
 
     fn request_mode(
@@ -629,7 +640,7 @@ fn handle_initial_configure_all(surface: &WlSurface, workspaces: &[crate::state:
         if let Some(window) = ws
             .space
             .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == surface)
+            .find(|w| w.toplevel().map(|t| t.wl_surface() == surface).unwrap_or(false))
         {
             let initial_configure_sent = with_states(surface, |states| {
                 states
@@ -645,7 +656,9 @@ fn handle_initial_configure_all(surface: &WlSurface, workspaces: &[crate::state:
                     surface = ?surface.id(),
                     "handle_initial_configure_all: sending initial configure"
                 );
-                window.toplevel().unwrap().send_configure();
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.send_configure();
+                }
             }
             return;
         }

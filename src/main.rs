@@ -86,7 +86,6 @@ use state::{
 // -------------------------------------------------------------------------
 // Session environment isolation
 // -------------------------------------------------------------------------
-
 /// Forcibly configure the process environment so that every child process
 /// (terminals, browsers, launchers …) connects to OUR Wayland display and
 /// never falls back to an X11/Wayland session on another TTY.
@@ -94,9 +93,6 @@ use state::{
 /// This MUST run:
 ///   1. AFTER the listening socket is created (so we know the socket name),
 ///   2. BEFORE any `std::process::Command` spawn (autostart, terminals …).
-///
-/// The function is intentionally aggressive: it clears every variable that
-/// could make a child discover a foreign display server or session bus.
 fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
     // ── Core Wayland identity ──
     std::env::set_var("WAYLAND_DISPLAY", socket_name);
@@ -105,62 +101,249 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
     std::env::set_var("XDG_SESSION_DESKTOP", "mywm");
 
     // ── Kill any X11 fallback path ──
-    // Removing DISPLAY prevents GTK / Qt / SDL from finding an Xwayland
-    // or bare X server on another VT.
     std::env::remove_var("DISPLAY");
 
     // ── Per-toolkit Wayland enforcement ──
-    // Firefox / Thunderbird (Gecko)
     std::env::set_var("MOZ_ENABLE_WAYLAND", "1");
-    std::env::set_var("MOZ_DBUS_REMOTE", "0"); // prevent DBus remote activation on TTY2
-
-    // GTK 3/4
     std::env::set_var("GDK_BACKEND", "wayland");
-
-    // Qt 5/6
     std::env::set_var("QT_QPA_PLATFORM", "wayland");
     std::env::set_var("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1");
-
-    // SDL2 (games, mpv …)
     std::env::set_var("SDL_VIDEODRIVER", "wayland");
-
-    // winit (Alacritty, wezterm …)
     std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
-
-    // Clutter (legacy GNOME apps)
     std::env::set_var("CLUTTER_BACKEND", "wayland");
-
-    // Electron / Chromium
-    // (Electron reads ELECTRON_OZONE_PLATFORM_HINT; Chromium reads
-    //  --ozone-platform=wayland but the env var also works.)
     std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
 
-    // ── DBus session isolation ──
-    // If a session bus from TTY2 leaked into our environment, apps like
-    // Firefox use it to activate an existing instance on TTY2 instead of
-    // opening a new window on our display. Clear it so apps either start
-    // a new bus or skip single-instance checks.
-    //
-    // NOTE: this means autostart entries that need DBus (e.g. waybar
-    // with the tray module) should launch `dbus-daemon` themselves or
-    // the rc.lua autostart list should include:
-    //   "eval $(dbus-launch --sh-syntax)"
-    // Uncomment the next line ONLY if you see windows teleporting to TTY2:
-    // std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
+    // ── Accessibility bus suppression ──
+    std::env::set_var("NO_AT_BRIDGE", "1");
+    std::env::set_var("GTK_A11Y", "none");
 
-    // A safer alternative: override the bus address so a NEW per-session
-    // bus is spawned automatically by the first client that needs one.
-    // This keeps DBus functional while isolating us from TTY2's bus.
+    // ── Session-unique identifier ──
+    // Used to isolate profile directories, DBus, etc.
+    let session_id = format!("mywm-{}", std::process::id());
+
+    // ══════════════════════════════════════════════════════════════
+    //  FIREFOX / THUNDERBIRD ISOLATION
+    //
+    //  Firefox discovers running instances via a LOCK FILE inside
+    //  the profile directory (~/.mozilla/firefox/<profile>/lock).
+    //  Neither --no-remote nor MOZ_NO_REMOTE prevents the new
+    //  process from acting as a *client* that hands off to the
+    //  existing instance and exits.
+    //
+    //  The ONLY reliable fix: give this session its own profile
+    //  root so there is no shared lock file to discover.
+    // ══════════════════════════════════════════════════════════════
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let our_bus_path = format!("unix:path={}/mywm-bus-{}", runtime_dir, std::process::id());
-        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &our_bus_path);
-        info!(bus = %our_bus_path, "session: overriding DBUS_SESSION_BUS_ADDRESS for isolation");
+        // Per-session Firefox profile root.
+        // Firefox will create a fresh "default" profile here on first launch.
+        let moz_dir = format!("{}/{}/mozilla", runtime_dir, session_id);
+        let tb_dir = format!("{}/{}/thunderbird", runtime_dir, session_id);
+
+        // Create the directories so Firefox doesn't error out.
+        let _ = std::fs::create_dir_all(&moz_dir);
+        let _ = std::fs::create_dir_all(&tb_dir);
+
+        // HOME/.mozilla → overridden by these env vars.
+        // Firefox checks these BEFORE falling back to ~/.mozilla.
+        std::env::set_var("MOZ_LEGACY_PROFILES", "0");
+        std::env::set_var("MOZ_NO_REMOTE", "1");
+        std::env::set_var("MOZ_DBUS_REMOTE", "0");
+
+        // The actual isolation: point Firefox's profile root elsewhere.
+        // Firefox respects the -profile flag but NOT an env var for the
+        // profile *root*. However, we can override HOME for child
+        // processes so ~/.mozilla resolves to our isolated directory.
+        //
+        // We use a session-private HOME overlay approach:
+        let isolated_home = format!("{}/{}/home", runtime_dir, session_id);
+        let real_home = std::env::var("HOME").unwrap_or_default();
+
+        let _ = std::fs::create_dir_all(&isolated_home);
+
+        // Symlink everything from real HOME except .mozilla and .thunderbird
+        setup_isolated_home(&real_home, &isolated_home, &moz_dir, &tb_dir);
+
+        std::env::set_var("HOME", &isolated_home);
+
+        // Preserve the real home for apps that need it (e.g. file dialogs).
+        std::env::set_var("MYWM_REAL_HOME", &real_home);
+
+        info!(
+            isolated_home = %isolated_home,
+            moz_dir = %moz_dir,
+            "session: HOME isolated for single-instance app separation"
+        );
+    }
+
+    // ── DBus session isolation ──
+    match launch_private_dbus_session() {
+        Ok(addr) => {
+            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &addr);
+            info!(bus = %addr, "session: launched private DBus session bus");
+        }
+        Err(err) => {
+            warn!(?err, "session: failed to launch private DBus — removing bus address");
+            std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
+        }
     }
 
     info!(
         wayland_display = ?socket_name,
         "session: environment variables locked to this compositor"
     );
+}
+
+/// Create an isolated HOME directory that symlinks everything from the
+/// real HOME *except* browser profile directories, which get their own
+/// fresh copies so profile lock files don't collide across sessions.
+fn setup_isolated_home(
+    real_home: &str,
+    isolated_home: &str,
+    moz_dir: &str,
+    tb_dir: &str,
+) {
+    // Directories that contain per-instance lock files and must NOT
+    // be shared across TTY sessions.
+    let isolated_dirs = [".mozilla", ".thunderbird"];
+
+    let real = std::path::Path::new(real_home);
+    let iso = std::path::Path::new(isolated_home);
+
+    // Read the real home and symlink all top-level entries except the
+    // ones we're isolating.
+    let entries = match std::fs::read_dir(real) {
+        Ok(e) => e,
+        Err(err) => {
+            warn!(?err, "cannot read real HOME for isolation");
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let target = iso.join(&name);
+
+        // Skip if already exists (idempotent).
+        if target.exists() || target.symlink_metadata().is_ok() {
+            continue;
+        }
+
+        if isolated_dirs.iter().any(|d| name_str == *d) {
+            // Don't symlink — we'll set up fresh directories instead.
+            continue;
+        }
+
+        // Create a symlink: isolated_home/<entry> -> real_home/<entry>
+        if let Err(err) = std::os::unix::fs::symlink(entry.path(), &target) {
+            // Not fatal — the entry just won't be visible.
+            tracing::trace!(
+                ?err,
+                entry = %name_str,
+                "isolated home: failed to symlink"
+            );
+        }
+    }
+
+    // Set up .mozilla pointing to our isolated directory.
+    let iso_moz = iso.join(".mozilla");
+    if !iso_moz.exists() {
+        // Create .mozilla/firefox inside isolated home.
+        let iso_moz_ff = iso.join(".mozilla").join("firefox");
+        let _ = std::fs::create_dir_all(&iso_moz_ff);
+    }
+
+    // Same for .thunderbird.
+    let iso_tb = iso.join(".thunderbird");
+    if !iso_tb.exists() {
+        let _ = std::fs::create_dir_all(&iso_tb);
+    }
+
+    info!(
+        real_home,
+        isolated_home,
+        "session: isolated HOME set up with symlinks"
+    );
+}
+
+/// Spawn a private `dbus-daemon --session` and return its bus address.
+fn launch_private_dbus_session() -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("dbus-launch")
+        .arg("--sh-syntax")
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "dbus-launch exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("DBUS_SESSION_BUS_ADDRESS=") {
+            let addr = rest
+                .trim_end_matches(';')
+                .trim_matches('\'')
+                .trim_matches('"');
+            if !addr.is_empty() {
+                for pid_line in stdout.lines() {
+                    let pid_line = pid_line.trim();
+                    if let Some(pid_str) = pid_line.strip_prefix("DBUS_SESSION_BUS_PID=") {
+                        let pid_str = pid_str.trim_end_matches(';');
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            DBUS_DAEMON_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+                            info!(pid, "session: dbus-daemon PID recorded for cleanup");
+                        }
+                    }
+                }
+                return Ok(addr.to_string());
+            }
+        }
+    }
+
+    Err(format!(
+        "could not parse DBUS_SESSION_BUS_ADDRESS from dbus-launch output: {stdout}"
+    )
+    .into())
+}
+
+static DBUS_DAEMON_PID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+fn kill_private_dbus_session() {
+    let pid = DBUS_DAEMON_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid != 0 {
+        info!(pid, "session: killing private dbus-daemon");
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+}
+
+/// Clean up the isolated home directory on shutdown.
+fn cleanup_isolated_home() {
+    if let (Ok(runtime_dir), Ok(real_home)) = (
+        std::env::var("XDG_RUNTIME_DIR"),
+        std::env::var("MYWM_REAL_HOME"),
+    ) {
+        // Restore HOME so nothing writes to the isolated dir during shutdown.
+        std::env::set_var("HOME", &real_home);
+
+        // Remove the per-session directory tree.
+        let session_dir = format!("{}/mywm-{}", runtime_dir, std::process::id());
+        if std::path::Path::new(&session_dir).exists() {
+            if let Err(err) = std::fs::remove_dir_all(&session_dir) {
+                warn!(?err, dir = %session_dir, "failed to clean up session directory");
+            } else {
+                info!(dir = %session_dir, "session: cleaned up isolated directory");
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -510,6 +693,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(session);
 
     let _ = std::fs::remove_file(ipc_socket_path);
+
+    // Kill our private dbus-daemon so it doesn't linger.
+    kill_private_dbus_session();
+    cleanup_isolated_home();
 
     info!("clean shutdown complete");
     Ok(())
