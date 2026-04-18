@@ -60,10 +60,7 @@ pub struct Workspace {
     pub space: Space<Window>,
     pub windows: Vec<Window>,
     pub spawn_times: HashMap<Window, Instant>,
-    /// Tracks the last configure size sent to each window so we only
-    /// send a new configure when the size actually changes.
     pub configured_sizes: HashMap<Window, (i32, i32)>,
-    /// The active tiling layout for this workspace.
     pub layout: LayoutType,
 }
 
@@ -137,8 +134,6 @@ pub struct State {
 
     pub needs_redraw: bool,
 
-    /// The GLES renderer. Lives here so DmabufHandler can import
-    /// buffers synchronously.
     pub renderer: GlesRenderer,
 }
 
@@ -190,25 +185,25 @@ pub struct CalloopData {
 // -------------------------------------------------------------------------
 
 impl State {
+    /// Focus a window: raise it, set keyboard focus, and — in Monocle
+    /// mode — immediately retile so the focused window is the visible one.
     pub fn focus_window(&mut self, window: &Window) {
         let ws = &mut self.workspaces[self.active_workspace];
         ws.space.raise_element(window, true);
 
-        // In Monocle mode, move the focused window to the end of the
-        // window list so it is the one that gets raised on next retile.
-        if ws.layout == LayoutType::Monocle {
-            if let Some(pos) = ws.windows.iter().position(|w| w == window) {
-                let w = ws.windows.remove(pos);
-                ws.windows.push(w);
-            }
-        }
-
-        let surface = window
-            .toplevel()
-            .map(|t| t.wl_surface().clone());
+        let surface = window.toplevel().map(|t| t.wl_surface().clone());
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, surface, serial);
+
+        // In Monocle the raise above is enough for the *current* frame,
+        // but we also retile so that `layout_monocle` records the
+        // correct focused surface for future retiles (e.g. triggered
+        // by commit handlers or animations).
+        if self.workspaces[self.active_workspace].layout == LayoutType::Monocle {
+            self.recalculate_layout();
+            self.needs_redraw = true;
+        }
     }
 
     pub fn close_focused(&mut self) {
@@ -234,18 +229,8 @@ impl State {
         }
         ws.space.unmap_elem(&window);
 
-        let output = self.output.clone();
-        let outer = self.config.outer_gaps;
-        let inner = self.config.inner_gaps;
-        let border = self.config.border_width;
-        Self::recalculate_layout_for(
-            &mut self.workspaces[self.active_workspace],
-            &output,
-            outer,
-            inner,
-            border,
-        );
-
+        // Set focus to the next candidate BEFORE retiling so
+        // layout_monocle can raise the correct window.
         let next_focus = self.workspaces[self.active_workspace]
             .windows
             .last()
@@ -255,6 +240,8 @@ impl State {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, next_focus, serial);
 
+        // Now retile with the updated focus.
+        self.recalculate_layout();
         self.needs_redraw = true;
     }
 
@@ -275,13 +262,9 @@ impl State {
             None => 0,
         };
         let next = ws.windows[next_idx].clone();
+
+        // focus_window handles raise + retile for Monocle.
         self.focus_window(&next);
-
-        // In Monocle mode, retile so the newly focused window is raised.
-        if self.workspaces[self.active_workspace].layout == LayoutType::Monocle {
-            self.recalculate_layout();
-        }
-
         self.needs_redraw = true;
     }
 
@@ -313,6 +296,8 @@ impl State {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, focus, serial);
 
+        // Retile so Monocle raises the focused window on this workspace.
+        self.recalculate_layout();
         self.needs_redraw = true;
     }
 
@@ -366,6 +351,17 @@ impl State {
         }
         dst_ws.windows.push(window);
 
+        // Update focus on the source workspace BEFORE retiling.
+        let next_focus = self.workspaces[src_idx]
+            .windows
+            .last()
+            .and_then(|w| w.toplevel())
+            .map(|t| t.wl_surface().clone());
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, next_focus.clone(), serial);
+
+        // Now retile both workspaces with the correct focus info.
         let output = self.output.clone();
         let outer = self.config.outer_gaps;
         let inner = self.config.inner_gaps;
@@ -376,23 +372,18 @@ impl State {
             outer,
             inner,
             border,
+            next_focus.as_ref(),
         );
+        // The destination workspace is not active, so no surface there
+        // holds focus — pass None (Monocle falls back to last window).
         Self::recalculate_layout_for(
             &mut self.workspaces[target_idx],
             &output,
             outer,
             inner,
             border,
+            None,
         );
-
-        let next_focus = self.workspaces[src_idx]
-            .windows
-            .last()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
-        let serial = SERIAL_COUNTER.next_serial();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, next_focus, serial);
 
         self.needs_redraw = true;
     }

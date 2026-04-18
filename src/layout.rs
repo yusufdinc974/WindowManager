@@ -9,9 +9,10 @@ use std::time::Instant;
 use smithay::{
     desktop::{layer_map_for_output, Space, Window},
     output::Output,
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point},
-    wayland::shell::xdg::XdgToplevelSurfaceData,
     wayland::compositor::with_states,
+    wayland::shell::xdg::XdgToplevelSurfaceData,
 };
 use tracing::{debug, info, trace};
 
@@ -21,7 +22,6 @@ use crate::state::{animation_progress, animation_scale, State, Workspace};
 // LayoutType enum
 // -------------------------------------------------------------------------
 
-/// The tiling algorithm applied to a workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayoutType {
     MasterStack,
@@ -36,12 +36,11 @@ impl Default for LayoutType {
 }
 
 impl LayoutType {
-    /// Cycle to the next layout: MasterStack → Monocle → Grid → MasterStack.
     pub fn cycle(&mut self) {
         *self = match self {
             Self::MasterStack => Self::Monocle,
-            Self::Monocle     => Self::Grid,
-            Self::Grid        => Self::MasterStack,
+            Self::Monocle => Self::Grid,
+            Self::Grid => Self::MasterStack,
         };
     }
 }
@@ -50,8 +49,8 @@ impl fmt::Display for LayoutType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MasterStack => write!(f, "Master/Stack"),
-            Self::Monocle     => write!(f, "Monocle"),
-            Self::Grid        => write!(f, "Grid"),
+            Self::Monocle => write!(f, "Monocle"),
+            Self::Grid => write!(f, "Grid"),
         }
     }
 }
@@ -61,12 +60,18 @@ impl fmt::Display for LayoutType {
 // -------------------------------------------------------------------------
 
 impl State {
+    /// Recalculate the tiling layout for a single workspace.
+    ///
+    /// `focused` is the `WlSurface` that currently holds keyboard focus.
+    /// The Monocle layout uses it to decide which window to raise on top;
+    /// other layouts ignore it.
     pub fn recalculate_layout_for(
         ws: &mut Workspace,
         output: &Output,
         outer_gap: i32,
         inner_gap: i32,
         border_width: i32,
+        focused: Option<&WlSurface>,
     ) {
         trace!(
             layout = %ws.layout,
@@ -110,7 +115,7 @@ impl State {
                 layout_master_stack(ws, origin, screen_w, screen_h, inner_gap, border_width);
             }
             LayoutType::Monocle => {
-                layout_monocle(ws, origin, screen_w, screen_h, border_width);
+                layout_monocle(ws, origin, screen_w, screen_h, border_width, focused);
             }
             LayoutType::Grid => {
                 layout_grid(ws, origin, screen_w, screen_h, inner_gap, border_width);
@@ -118,13 +123,16 @@ impl State {
         }
     }
 
+    /// Convenience wrapper: retile the active workspace, automatically
+    /// pulling the current keyboard focus.
     pub fn recalculate_layout(&mut self) {
         let output = self.output.clone();
         let outer = self.config.outer_gaps;
         let inner = self.config.inner_gaps;
         let border = self.config.border_width;
+        let focused = self.keyboard.current_focus();
         let ws = &mut self.workspaces[self.active_workspace];
-        Self::recalculate_layout_for(ws, &output, outer, inner, border);
+        Self::recalculate_layout_for(ws, &output, outer, inner, border, focused.as_ref());
     }
 
     /// Cycle the active workspace's layout and immediately retile.
@@ -137,24 +145,13 @@ impl State {
             layout = %layout,
             "layout cycled"
         );
-
-        let output = self.output.clone();
-        let outer = self.config.outer_gaps;
-        let inner = self.config.inner_gaps;
-        let border = self.config.border_width;
-        Self::recalculate_layout_for(
-            &mut self.workspaces[ws_idx],
-            &output,
-            outer,
-            inner,
-            border,
-        );
+        self.recalculate_layout();
         self.needs_redraw = true;
     }
 }
 
 // -------------------------------------------------------------------------
-// Master/Stack layout (existing logic)
+// Master/Stack layout
 // -------------------------------------------------------------------------
 
 fn layout_master_stack(
@@ -168,7 +165,7 @@ fn layout_master_stack(
     let now = Instant::now();
 
     match ws.windows.len() {
-        0 => unreachable!(), // caller guards against empty
+        0 => unreachable!(),
         1 => {
             let (loc, size) = animate_slot(
                 &ws.windows[0],
@@ -203,7 +200,6 @@ fn layout_master_stack(
                 "layout[master/stack]: params"
             );
 
-            // Master window
             let (m_loc, m_size) = animate_slot(
                 &ws.windows[0],
                 &ws.spawn_times,
@@ -221,7 +217,6 @@ fn layout_master_stack(
                 &mut ws.configured_sizes,
             );
 
-            // Stack windows
             let total_inner = inner_gap * (stack_count - 1).max(0);
             let usable_h = (screen_h - total_inner).max(0);
             let slice_h = usable_h / stack_count.max(1);
@@ -256,8 +251,8 @@ fn layout_master_stack(
 }
 
 // -------------------------------------------------------------------------
-// Monocle layout — every window occupies the full available area;
-// only the focused (last-raised) window is visually on top.
+// Monocle layout — every window occupies the full area; the *focused*
+// window is raised to the top of the Z-stack.
 // -------------------------------------------------------------------------
 
 fn layout_monocle(
@@ -266,11 +261,13 @@ fn layout_monocle(
     screen_w: i32,
     screen_h: i32,
     border_width: i32,
+    focused: Option<&WlSurface>,
 ) {
     let now = Instant::now();
 
     debug!(
         count = ws.windows.len(),
+        focused = ?focused.map(|s| s.id()),
         "layout[monocle]: tiling all windows to full area"
     );
 
@@ -293,28 +290,37 @@ fn layout_monocle(
         );
     }
 
-    // Raise the last window in the list (the focused one) so it
-    // renders on top of all the others in the space.
-    if let Some(top) = ws.windows.last().cloned() {
-        ws.space.raise_element(&top, true);
+    // Determine which window to raise.
+    //
+    //  1. Prefer the window whose toplevel surface matches `focused`.
+    //  2. Fall back to the last window in the list (i.e. the most
+    //     recently focused or spawned window).
+    //
+    // This guarantees that the visible window in Monocle mode is always
+    // the one the user has actually focused, not just the most recently
+    // spawned one.
+    let top = focused
+        .and_then(|surf| {
+            ws.windows.iter().find(|w| {
+                w.toplevel()
+                    .map(|t| t.wl_surface() == surf)
+                    .unwrap_or(false)
+            })
+        })
+        .or(ws.windows.last())
+        .cloned();
+
+    if let Some(ref w) = top {
+        debug!(
+            surface = ?w.toplevel().map(|t| t.wl_surface().id()),
+            "layout[monocle]: raising focused window"
+        );
+        ws.space.raise_element(w, true);
     }
 }
 
 // -------------------------------------------------------------------------
-// Grid layout — divide available space into an even grid.
-//
-// Strategy:
-//   cols = ceil(sqrt(n))
-//   rows = ceil(n / cols)
-//
-// Examples:
-//   1 window  → 1×1  (full screen)
-//   2 windows → 2×1  (side-by-side)
-//   3 windows → 2×2  (one cell empty)
-//   4 windows → 2×2
-//   5 windows → 3×2  (one cell empty)
-//   6 windows → 3×2
-//   9 windows → 3×3
+// Grid layout
 // -------------------------------------------------------------------------
 
 fn layout_grid(
@@ -331,14 +337,8 @@ fn layout_grid(
     let cols = (n as f64).sqrt().ceil() as i32;
     let rows = ((n as f64) / (cols as f64)).ceil() as i32;
 
-    debug!(
-        n,
-        cols,
-        rows,
-        "layout[grid]: grid dimensions"
-    );
+    debug!(n, cols, rows, "layout[grid]: grid dimensions");
 
-    // Total gap space consumed by inner gaps between cells.
     let total_gap_x = inner_gap * (cols - 1).max(0);
     let total_gap_y = inner_gap * (rows - 1).max(0);
 
@@ -349,8 +349,6 @@ fn layout_grid(
         let col = (i as i32) % cols;
         let row = (i as i32) / cols;
 
-        // For the last column and last row, absorb any leftover pixels
-        // to avoid sub-pixel gaps at the right/bottom edge.
         let is_last_col = col == cols - 1;
         let is_last_row = row == rows - 1;
 
@@ -389,13 +387,9 @@ fn layout_grid(
 }
 
 // -------------------------------------------------------------------------
-// Animation helper
+// Animation helpers (unchanged)
 // -------------------------------------------------------------------------
 
-/// Compute the animated position for a window. The animation only
-/// affects the **position** (a centering offset that converges to zero),
-/// NOT the size. This avoids flooding clients with configure events
-/// during the 200 ms spawn-in animation.
 fn animate_slot(
     window: &Window,
     spawn_times: &HashMap<Window, Instant>,
@@ -418,8 +412,6 @@ fn animate_slot(
     (new_loc, size)
 }
 
-/// Map a window into the space and send a configure **only** if the
-/// size actually changed since the last configure we sent.
 fn place_tile(
     space: &mut Space<Window>,
     window: &Window,

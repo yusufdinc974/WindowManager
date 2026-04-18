@@ -116,8 +116,9 @@ impl CompositorHandler for State {
             let outer = self.config.outer_gaps;
             let inner = self.config.inner_gaps;
             let border = self.config.border_width;
+            let focused = self.keyboard.current_focus();
             for ws in self.workspaces.iter_mut() {
-                Self::recalculate_layout_for(ws, &out, outer, inner, border);
+                Self::recalculate_layout_for(ws, &out, outer, inner, border, focused.as_ref());
             }
         }
 
@@ -145,7 +146,7 @@ delegate_compositor!(State);
 delegate_shm!(State);
 
 // -------------------------------------------------------------------------
-// DmabufHandler — SYNCHRONOUS import via self.renderer
+// DmabufHandler
 // -------------------------------------------------------------------------
 
 impl DmabufHandler for State {
@@ -207,7 +208,17 @@ impl XdgShellHandler for State {
             "about to recalculate_layout_for"
         );
 
-        Self::recalculate_layout_for(ws, &self.output, outer, inner, border);
+        // The new window is about to receive focus, so pass its surface
+        // so Monocle raises it.
+        let new_surface = surface.wl_surface().clone();
+        Self::recalculate_layout_for(
+            ws,
+            &self.output,
+            outer,
+            inner,
+            border,
+            Some(&new_surface),
+        );
 
         if let Some(toplevel) = window.toplevel() {
             toplevel.with_pending_state(|s| {
@@ -240,7 +251,7 @@ impl XdgShellHandler for State {
         debug!("new_toplevel complete");
     }
 
-      fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let dying_surface = surface.wl_surface().clone();
         info!(
             surface = ?dying_surface.id(),
@@ -274,13 +285,7 @@ impl XdgShellHandler for State {
             }
         }
 
-        let outer = self.config.outer_gaps;
-        let inner = self.config.inner_gaps;
-        let border = self.config.border_width;
-        for ws in self.workspaces.iter_mut() {
-            Self::recalculate_layout_for(ws, &self.output, outer, inner, border);
-        }
-
+        // Update focus before retiling so Monocle raises the right window.
         let focus = self.workspaces[self.active_workspace]
             .windows
             .last()
@@ -288,7 +293,14 @@ impl XdgShellHandler for State {
             .map(|t| t.wl_surface().clone());
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, focus, serial);
+        keyboard.set_focus(self, focus.clone(), serial);
+
+        let outer = self.config.outer_gaps;
+        let inner = self.config.inner_gaps;
+        let border = self.config.border_width;
+        for ws in self.workspaces.iter_mut() {
+            Self::recalculate_layout_for(ws, &self.output, outer, inner, border, focus.as_ref());
+        }
 
         self.needs_redraw = true;
 
@@ -437,8 +449,9 @@ impl WlrLayerShellHandler for State {
         let outer = self.config.outer_gaps;
         let inner = self.config.inner_gaps;
         let border = self.config.border_width;
+        let focused = self.keyboard.current_focus();
         for ws in self.workspaces.iter_mut() {
-            Self::recalculate_layout_for(ws, &out, outer, inner, border);
+            Self::recalculate_layout_for(ws, &out, outer, inner, border, focused.as_ref());
         }
         self.needs_redraw = true;
     }
@@ -459,8 +472,9 @@ impl WlrLayerShellHandler for State {
         let outer = self.config.outer_gaps;
         let inner = self.config.inner_gaps;
         let border = self.config.border_width;
+        let focused = self.keyboard.current_focus();
         for ws in self.workspaces.iter_mut() {
-            Self::recalculate_layout_for(ws, &output, outer, inner, border);
+            Self::recalculate_layout_for(ws, &output, outer, inner, border, focused.as_ref());
         }
         self.needs_redraw = true;
     }

@@ -23,6 +23,7 @@ use smithay::{
 };
 use tracing::{debug, info, trace, warn};
 
+use crate::layout::LayoutType;
 use crate::state::State;
 
 // -------------------------------------------------------------------------
@@ -150,7 +151,7 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         KeyAction::SpawnLauncher => {
             info!("Action SpawnLauncher not yet implemented");
         }
-        KeyAction::ToggleFullscreen => {
+                KeyAction::ToggleFullscreen => {
             info!("Action ToggleFullscreen not yet implemented");
         }
         KeyAction::CycleLayout => {
@@ -224,16 +225,30 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             let pos = state.pointer_location;
             let under = surface_under_pointer(state, pos);
 
-            if let Some((surface, _)) = under.as_ref() {
+            // Sloppy focus: when the pointer enters a window surface,
+            // focus it. In Monocle mode we go through focus_window()
+            // which also raises + retiles so the correct window is
+            // brought to the front.
+            if let Some((ref surface, _)) = under {
                 let ws = &state.workspaces[state.active_workspace];
-                let is_window = ws.windows.iter().any(|w| {
+                let is_monocle = ws.layout == LayoutType::Monocle;
+
+                // Find the Window object that owns this surface.
+                let target_window = ws.windows.iter().find(|w| {
                     w.toplevel().map(|t| t.wl_surface()) == Some(surface)
-                });
-                if is_window {
+                }).cloned();
+
+                if let Some(window) = target_window {
                     let keyboard = state.keyboard.clone();
                     if keyboard.current_focus().as_ref() != Some(surface) {
-                        let serial = SERIAL_COUNTER.next_serial();
-                        keyboard.set_focus(state, Some(surface.clone()), serial);
+                        if is_monocle {
+                            // focus_window handles set_focus + raise +
+                            // retile in one shot.
+                            state.focus_window(&window);
+                        } else {
+                            let serial = SERIAL_COUNTER.next_serial();
+                            keyboard.set_focus(state, Some(surface.clone()), serial);
+                        }
                     }
                 }
             }
@@ -266,6 +281,7 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
                 let ws = &state.workspaces[state.active_workspace];
                 let hit = ws.space.element_under(pos).map(|(w, _)| w.clone());
                 if let Some(window) = hit {
+                    // focus_window handles raise + Monocle retile.
                     state.focus_window(&window);
                 }
             }
