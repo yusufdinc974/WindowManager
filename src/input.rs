@@ -445,33 +445,11 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             }
 
             // ── Normal (no-grab) pointer motion ──
+            // CLICK-TO-FOCUS: We intentionally do NOT change keyboard
+            // focus here. Focus changes happen ONLY on button press.
+            // We still update the pointer surface so hover cursors
+            // (resize handles, text-input I-beams, etc.) work correctly.
             let under = surface_under_pointer(state, pos);
-
-            // NEVER steal keyboard focus from a layer surface via
-            // pointer hover. The layer surface keeps focus until it
-            // is dismissed or destroyed.
-            if !state.layer_has_keyboard_focus() {
-                if let Some((ref surface, _)) = under {
-                    let ws = &state.workspaces[state.active_workspace];
-                    let is_monocle = ws.layout == LayoutType::Monocle;
-
-                    let target_window = ws.windows.iter().find(|w| {
-                        w.toplevel().map(|t| t.wl_surface()) == Some(surface)
-                    }).cloned();
-
-                    if let Some(window) = target_window {
-                        let keyboard = state.keyboard.clone();
-                        if keyboard.current_focus().as_ref() != Some(surface) {
-                            if is_monocle {
-                                state.focus_window(&window);
-                            } else {
-                                let serial = SERIAL_COUNTER.next_serial();
-                                keyboard.set_focus(state, Some(surface.clone()), serial);
-                            }
-                        }
-                    }
-                }
-            }
 
             let pointer = state.pointer.clone();
             let serial = SERIAL_COUNTER.next_serial();

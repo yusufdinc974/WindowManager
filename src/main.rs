@@ -56,7 +56,7 @@ use smithay::{
             protocol::wl_surface::WlSurface, Display, DisplayHandle,
         },
     },
-    utils::{DeviceFd, Logical, Point, Transform},
+    utils::{DeviceFd, Logical, Point, Transform, Physical},
     wayland::{
         compositor::CompositorState,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
@@ -924,9 +924,95 @@ fn render_frame(data: &mut CalloopData) {
         }
     };
 
-    let mut wrapped: Vec<OutputRenderElements> =
-        Vec::with_capacity(space_elements.len() + 1);
+    // ── Build border elements for every mapped window ──
+    let border_width = state.config.border_width.max(0);
+    let focused_surface = state.keyboard.current_focus();
 
+    let active_color = parse_hex_color(&state.config.active_border_color);
+    let inactive_color = parse_hex_color(&state.config.inactive_border_color);
+
+    let mut border_elements: Vec<OutputRenderElements> = Vec::new();
+
+    let ws = &state.workspaces[state.active_workspace];
+    for window in ws.space.elements() {
+        if border_width <= 0 {
+            break;
+        }
+
+        let Some(loc) = ws.space.element_location(window) else {
+            continue;
+        };
+
+        let geo = window.geometry();
+        if geo.size.w <= 0 || geo.size.h <= 0 {
+            continue;
+        }
+
+        let is_focused = window
+            .toplevel()
+            .map(|t| focused_surface.as_ref() == Some(t.wl_surface()))
+            .unwrap_or(false);
+
+        let color = if is_focused { active_color } else { inactive_color };
+
+        let bw = border_width;
+
+        let outer_x = loc.x - bw;
+        let outer_y = loc.y - bw;
+        let outer_w = geo.size.w + 2 * bw;
+        let outer_h = geo.size.h + 2 * bw;
+
+        // Top edge
+        let top_buf = SolidColorBuffer::new((outer_w, bw), color);
+        let top_elem = SolidColorRenderElement::from_buffer(
+            &top_buf,
+            Point::<i32, Physical>::from((outer_x, outer_y)),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        );
+        border_elements.push(OutputRenderElements::Cursor(top_elem));
+
+        // Bottom edge
+        let bot_buf = SolidColorBuffer::new((outer_w, bw), color);
+        let bot_elem = SolidColorRenderElement::from_buffer(
+            &bot_buf,
+            Point::<i32, Physical>::from((outer_x, outer_y + outer_h - bw)),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        );
+        border_elements.push(OutputRenderElements::Cursor(bot_elem));
+
+        // Left edge
+        let left_buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), color);
+        let left_elem = SolidColorRenderElement::from_buffer(
+            &left_buf,
+            Point::<i32, Physical>::from((outer_x, outer_y + bw)),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        );
+        border_elements.push(OutputRenderElements::Cursor(left_elem));
+
+        // Right edge
+        let right_buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), color);
+        let right_elem = SolidColorRenderElement::from_buffer(
+            &right_buf,
+            Point::<i32, Physical>::from((outer_x + outer_w - bw, outer_y + bw)),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        );
+        border_elements.push(OutputRenderElements::Cursor(right_elem));
+    }
+
+    // ── Assemble final element list ──
+    // Order: cursor (top) → windows → borders (behind windows)
+    let mut wrapped: Vec<OutputRenderElements> =
+        Vec::with_capacity(space_elements.len() + border_elements.len() + 1);
+
+    // Cursor on top of everything.
     let cursor_loc = state.pointer_location.to_i32_round().to_physical(1);
     let cursor_elem = SolidColorRenderElement::from_buffer(
         &state.cursor_buffer,
@@ -936,7 +1022,12 @@ fn render_frame(data: &mut CalloopData) {
         Kind::Cursor,
     );
     wrapped.push(OutputRenderElements::Cursor(cursor_elem));
+
+    // Window surfaces.
     wrapped.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+
+    // Borders behind the windows.
+    wrapped.extend(border_elements);
 
     let _ = &state.cursor_status;
 
@@ -975,9 +1066,6 @@ fn render_frame(data: &mut CalloopData) {
     }
 
     // Send frame callbacks to layer surfaces (waybar, fuzzel, etc.).
-    // Without this, layer surfaces that request wl_surface.frame() will
-    // never get the callback and stop redrawing — which is why fuzzel
-    // appears but cannot display typed characters.
     {
         let map = layer_map_for_output(&output);
         for layer in map.layers() {
@@ -986,6 +1074,7 @@ fn render_frame(data: &mut CalloopData) {
             });
         }
     }
+
     state.workspaces[state.active_workspace].space.refresh();
     state.popups.cleanup();
 
@@ -996,6 +1085,23 @@ fn render_frame(data: &mut CalloopData) {
     }
 }
 
+/// Parse a hex color string like "#7aa2f7" into [f32; 4] RGBA.
+/// Returns opaque white on parse failure.
+fn parse_hex_color(hex: &str) -> [f32; 4] {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() < 6 {
+        return [1.0, 1.0, 1.0, 1.0];
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255) as f32 / 255.0;
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(255) as f32 / 255.0;
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255) as f32 / 255.0;
+    let a = if hex.len() >= 8 {
+        u8::from_str_radix(&hex[6..8], 16).unwrap_or(255) as f32 / 255.0
+    } else {
+        1.0
+    };
+    [r, g, b, a]
+}
 fn handle_drm_event(event: DrmEvent, data: &mut CalloopData) {
     match event {
         DrmEvent::VBlank(crtc) => {
