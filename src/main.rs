@@ -28,7 +28,11 @@ use smithay::{
         egl::{EGLContext, EGLDisplay},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            element::surface::WaylandSurfaceRenderElement,
+            element::{
+                solid::{SolidColorBuffer, SolidColorRenderElement},
+                surface::WaylandSurfaceRenderElement,
+                Kind,
+            },
             gles::GlesRenderer,
             Color32F,
         },
@@ -39,7 +43,7 @@ use smithay::{
         space::{space_render_elements, SpaceRenderElements},
         PopupManager, Space, Window, WindowSurfaceType,
     },
-    input::{keyboard::XkbConfig, Seat, SeatState},
+    input::{keyboard::XkbConfig, pointer::CursorImageStatus, Seat, SeatState},
     output::{Mode as WlOutputMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
@@ -355,6 +359,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyboard,
         pointer,
         pointer_location: Point::from((0.0, 0.0)),
+        cursor_status: CursorImageStatus::default_named(),
+        cursor_buffer: SolidColorBuffer::new((12, 12), [1.0, 1.0, 1.0, 1.0]),
         workspaces,
         active_workspace: 0,
         output,
@@ -604,6 +610,15 @@ fn init_drm_backend(
     Ok((backend, output, drm_notifier))
 }
 
+// A single render element on the output is either a surface the Space
+// wants drawn (windows + layer-shell surfaces) or our solid-colour
+// fallback cursor sprite, composited on top.
+smithay::backend::renderer::element::render_elements! {
+    OutputRenderElements<=GlesRenderer>;
+    Space = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Cursor = SolidColorRenderElement,
+}
+
 fn render_frame(data: &mut CalloopData) {
     let CalloopData { state, backend } = data;
 
@@ -614,7 +629,7 @@ fn render_frame(data: &mut CalloopData) {
 
     let active_space = &state.workspaces[state.active_workspace].space;
     let spaces = [active_space];
-    let elements = match space_render_elements(
+    let space_elements = match space_render_elements(
         &mut backend.renderer,
         spaces,
         &state.output,
@@ -626,8 +641,28 @@ fn render_frame(data: &mut CalloopData) {
             return;
         }
     };
-    let wrapped: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-        elements;
+
+    // Build the final element list: cursor first (top of Z-order), then
+    // every space element underneath it.
+    let mut wrapped: Vec<OutputRenderElements> =
+        Vec::with_capacity(space_elements.len() + 1);
+
+    // The cursor lives in logical coords; convert to physical (scale=1
+    // for now since we set Scale::Integer(1) on the output).
+    let cursor_loc = state.pointer_location.to_i32_round().to_physical(1);
+    let cursor_elem = SolidColorRenderElement::from_buffer(
+        &state.cursor_buffer,
+        cursor_loc,
+        1.0,
+        1.0,
+        Kind::Cursor,
+    );
+    wrapped.push(OutputRenderElements::Cursor(cursor_elem));
+    wrapped.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+
+    // Silence unused-warning for cursor_status until we honour
+    // client-provided cursor surfaces.
+    let _ = &state.cursor_status;
 
     match backend.compositor.render_frame::<_, _>(
         &mut backend.renderer,

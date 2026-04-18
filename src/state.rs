@@ -14,10 +14,14 @@ use smithay::{
             compositor::DrmCompositor, exporter::gbm::GbmFramebufferExporter, DrmDeviceFd,
             DrmNode,
         },
-        renderer::gles::GlesRenderer,
+        renderer::{element::solid::SolidColorBuffer, gles::GlesRenderer},
     },
     desktop::{PopupManager, Space, Window},
-    input::{keyboard::KeyboardHandle, pointer::PointerHandle, Seat, SeatState},
+    input::{
+        keyboard::KeyboardHandle,
+        pointer::{CursorImageStatus, PointerHandle},
+        Seat, SeatState,
+    },
     output::Output,
     reexports::{
         calloop::LoopSignal,
@@ -88,6 +92,13 @@ pub struct State {
     pub keyboard: KeyboardHandle<Self>,
     pub pointer: PointerHandle<Self>,
     pub pointer_location: Point<f64, Logical>,
+
+    /// Latest cursor-image request from the focused client
+    /// (CursorImageStatus::Default if no client has set one).
+    pub cursor_status: CursorImageStatus,
+    /// Fallback cursor: a small solid-colour square drawn at
+    /// `pointer_location` on top of everything else.
+    pub cursor_buffer: SolidColorBuffer,
 
     pub workspaces: Vec<Workspace>,
     pub active_workspace: usize,

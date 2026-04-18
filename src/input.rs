@@ -16,8 +16,14 @@ use smithay::{
         },
         libinput::LibinputInputBackend,
     },
-    input::keyboard::{FilterResult, Keysym, KeysymHandle, ModifiersState},
-    utils::SERIAL_COUNTER,
+    desktop::{layer_map_for_output, WindowSurfaceType},
+    input::{
+        keyboard::{FilterResult, Keysym, KeysymHandle, ModifiersState},
+        pointer::{ButtonEvent, MotionEvent},
+    },
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{Logical, Point, SERIAL_COUNTER},
+    wayland::shell::wlr_layer::Layer as WlrLayer,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -217,20 +223,75 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
                 y = state.pointer_location.y,
                 "libinput pointer moved"
             );
+
+            let pos = state.pointer_location;
+            let under = surface_under_pointer(state, pos);
+
+            // Sloppy focus: if the pointer is over a tracked toplevel
+            // window, move keyboard focus to it. Layer surfaces (bars,
+            // wallpapers) never steal keyboard focus.
+            if let Some((surface, _)) = under.as_ref() {
+                let ws = &state.workspaces[state.active_workspace];
+                let is_window = ws.windows.iter().any(|w| {
+                    w.toplevel().map(|t| t.wl_surface()) == Some(surface)
+                });
+                if is_window {
+                    let keyboard = state.keyboard.clone();
+                    if keyboard.current_focus().as_ref() != Some(surface) {
+                        let serial = SERIAL_COUNTER.next_serial();
+                        keyboard.set_focus(state, Some(surface.clone()), serial);
+                    }
+                }
+            }
+
+            let pointer = state.pointer.clone();
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = event.time_msec();
+            pointer.motion(
+                state,
+                under,
+                &MotionEvent {
+                    location: pos,
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(state);
+
+            // Cursor moved on screen — redraw so the cursor sprite
+            // follows.
+            state.needs_redraw = true;
         }
 
         InputEvent::PointerButton { event } => {
-            if event.state() != ButtonState::Pressed {
-                return;
+            let button = event.button_code();
+            let button_state = event.state();
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = event.time_msec();
+
+            // Click-to-focus: only on press, only for real toplevels.
+            if button_state == ButtonState::Pressed {
+                let pos = state.pointer_location;
+                let ws = &state.workspaces[state.active_workspace];
+                let hit = ws.space.element_under(pos).map(|(w, _)| w.clone());
+                if let Some(window) = hit {
+                    state.focus_window(&window);
+                }
             }
-            let ws = &state.workspaces[state.active_workspace];
-            let hit = ws
-                .space
-                .element_under(state.pointer_location)
-                .map(|(w, _)| w.clone());
-            if let Some(window) = hit {
-                state.focus_window(&window);
-            }
+
+            // Always route both press and release to the client so it
+            // can complete its own button handling.
+            let pointer = state.pointer.clone();
+            pointer.button(
+                state,
+                &ButtonEvent {
+                    button,
+                    state: button_state,
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(state);
         }
 
         InputEvent::DeviceAdded { device } => {
@@ -263,6 +324,71 @@ pub fn handle_ipc_command(state: &mut State, cmd: IpcCommand) {
             state.close_focused();
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// Pointer focus lookup
+// -------------------------------------------------------------------------
+
+/// Find the surface directly under `pos` in screen coordinates, preferring
+/// (in z-order, top-first):
+///   1. Overlay / Top layer-shell surfaces (e.g. lock-screen, dropdown menus).
+///   2. The active workspace's window stack.
+///   3. Bottom / Background layer-shell surfaces (e.g. wallpapers).
+///
+/// Returns the surface together with the pointer position translated into
+/// its own local coordinate system — which is exactly what
+/// `PointerHandle::motion` wants as the focus arg.
+fn surface_under_pointer(
+    state: &State,
+    pos: Point<f64, Logical>,
+) -> Option<(WlSurface, Point<f64, Logical>)> {
+    // ── 1. Layers above windows ─────────────────────────────────────
+    {
+        let map = layer_map_for_output(&state.output);
+        if let Some(layer) = map
+            .layer_under(WlrLayer::Overlay, pos)
+            .or_else(|| map.layer_under(WlrLayer::Top, pos))
+        {
+            let layer_loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+            let local = pos - layer_loc.to_f64();
+            if let Some((surface, surface_loc)) =
+                layer.surface_under(local, WindowSurfaceType::ALL)
+            {
+                return Some((surface, (surface_loc + layer_loc).to_f64()));
+            }
+        }
+    }
+
+    // ── 2. Tiled / floating windows on the active workspace ─────────
+    let ws = &state.workspaces[state.active_workspace];
+    if let Some((window, win_loc)) = ws.space.element_under(pos) {
+        let local = pos - win_loc.to_f64();
+        if let Some((surface, surface_loc)) =
+            window.surface_under(local, WindowSurfaceType::ALL)
+        {
+            return Some((surface, (surface_loc + win_loc).to_f64()));
+        }
+    }
+
+    // ── 3. Layers below windows ─────────────────────────────────────
+    {
+        let map = layer_map_for_output(&state.output);
+        if let Some(layer) = map
+            .layer_under(WlrLayer::Bottom, pos)
+            .or_else(|| map.layer_under(WlrLayer::Background, pos))
+        {
+            let layer_loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+            let local = pos - layer_loc.to_f64();
+            if let Some((surface, surface_loc)) =
+                layer.surface_under(local, WindowSurfaceType::ALL)
+            {
+                return Some((surface, (surface_loc + layer_loc).to_f64()));
+            }
+        }
+    }
+
+    None
 }
 
 fn spawn_terminal() {
