@@ -1,6 +1,4 @@
-//! Phase 10+29: bare-metal Wayland compositor entry point.
-
-
+//! Phase 10+30: bare-metal Wayland compositor entry point.
 
 use std::{
     collections::HashSet,
@@ -88,7 +86,7 @@ use state::{
 };
 
 // -------------------------------------------------------------------------
-// Session environment isolation (unchanged)
+// Session environment isolation
 // -------------------------------------------------------------------------
 
 fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
@@ -267,12 +265,24 @@ fn cleanup_isolated_home() {
 }
 
 // -------------------------------------------------------------------------
+// Helper: set file executable
+// -------------------------------------------------------------------------
+
+fn set_executable(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+// -------------------------------------------------------------------------
 // main
 // -------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-     // ── Phase 30: Kill libwayland wire protocol spam ──
+    // ── Phase 30: Kill libwayland wire protocol spam ──
     std::env::remove_var("WAYLAND_DEBUG");
 
     tracing_subscriber::fmt()
@@ -295,7 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .init();
 
-    info!("bootstrapping bare-metal Wayland compositor (Phase 10+29)");
+    info!("bootstrapping bare-metal Wayland compositor (Phase 10+30)");
 
     let (lua, config) = Config::load_from_lua();
     info!(
@@ -530,85 +540,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    fn ensure_waybar_config() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            warn!("ensure_waybar_config: HOME is empty, skipping");
-            return;
-        }
-
-        let waybar_dir = format!("{}/.config/waybar", home);
-        let waybar_path = std::path::Path::new(&waybar_dir);
-        if waybar_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
-            info!(path = %waybar_dir, "removing waybar config symlink");
-            let _ = std::fs::remove_file(&waybar_dir);
-        }
-        if waybar_path.is_dir() {
-            info!(path = %waybar_dir, "removing existing waybar config dir");
-            let _ = std::fs::remove_dir_all(&waybar_dir);
-        }
-        if let Err(err) = std::fs::create_dir_all(&waybar_dir) {
-            warn!(?err, dir = %waybar_dir, "failed to create waybar config dir");
-            return;
-        }
-
-        let config_path = format!("{}/config", waybar_dir);
-        info!(path = %config_path, "writing waybar config from asset");
-        let _ = std::fs::write(&config_path, include_str!("../assets/waybar-config.json"));
-
-        let style_path = format!("{}/style.css", waybar_dir);
-        info!(path = %style_path, "writing waybar style.css from asset");
-        let _ = std::fs::write(&style_path, include_str!("../assets/waybar-style.css"));
-
-        let colors_path = format!("{}/colors.css", waybar_dir);
-        info!(path = %colors_path, "writing bootstrap colors.css");
-        let _ = std::fs::write(&colors_path, r#"/* Bootstrap colors — overwritten by rc.lua write_theme_css() */
-@define-color bg_color #1a1b26;
-@define-color bg_alt_color #24283b;
-@define-color bg_surface_color #292e42;
-@define-color fg_color #c0caf5;
-@define-color fg_dim_color #565f89;
-@define-color fg_bright_color #e0e6ff;
-@define-color accent_color #7aa2f7;
-@define-color accent2_color #bb9af7;
-@define-color accent3_color #ff007c;
-@define-color green_color #73daca;
-@define-color red_color #f7768e;
-@define-color orange_color #ff9e64;
-@define-color yellow_color #e0af68;
-@define-color cyan_color #7dcfff;
-@define-color teal_color #2ac3de;
-@define-color magenta_color #c678dd;
-@define-color pink_color #ff79c6;
-@define-color urgent_color #db4b4b;
-@define-color success_color #9ece6a;
-@define-color warning_color #e0af68;
-@define-color active_border #7aa2f7;
-@define-color inactive_border #1a1b26;
-@define-color bar_bg_color rgba(26, 27, 38, 0.92);
-@define-color accent_hover rgba(122, 162, 247, 0.15);
-@define-color accent_subtle rgba(122, 162, 247, 0.10);
-@define-color accent_border rgba(122, 162, 247, 0.30);
-@define-color red_hover rgba(247, 118, 142, 0.20);
-@define-color red_subtle rgba(247, 118, 142, 0.10);
-@define-color orange_hover rgba(255, 158, 100, 0.18);
-@define-color green_subtle rgba(115, 218, 202, 0.10);
-@define-color separator_color rgba(59, 66, 97, 0.50);
-@define-color border_glow rgba(122, 162, 247, 0.35);
-"#);
-
-        if let Ok(real_home) = std::env::var("MYWM_REAL_HOME") {
-            let real_waybar_dir = format!("{}/.config/waybar", real_home);
-            let real_waybar_path = std::path::Path::new(&real_waybar_dir);
-            if real_waybar_path.is_dir() {
-                info!(path = %real_waybar_dir, "cleaning stale waybar config from real HOME");
-                let _ = std::fs::remove_dir_all(&real_waybar_dir);
-            }
-        }
-
-        info!(waybar_dir = %waybar_dir, "waybar config deployed");
-    }
-
     let state = State {
         start_time: std::time::Instant::now(),
         display_handle,
@@ -642,7 +573,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         swipe_fingers: 0,
         swipe_dx: 0.0,
         workspace_transition: state::WorkspaceTransition::default(),
-        // ── Phase 29 ──
         window_opacity: 1.0,
     };
 
@@ -721,7 +651,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(crate::state::workspace_ipc_stream_path());
     let _ = std::fs::remove_file(crate::state::opacity_ipc_path());
 
-        // Kill orphaned Waybar and helper scripts
+    // Kill orphaned Waybar and helper scripts
     let _ = std::process::Command::new("pkill")
         .args(["-f", "mywm-workspaces.sh"])
         .status();
@@ -740,7 +670,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // -------------------------------------------------------------------------
-// DRM backend init (unchanged)
+// ensure_waybar_config — deploys Waybar + mywm scripts to isolated HOME
+// -------------------------------------------------------------------------
+
+fn ensure_waybar_config() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        warn!("ensure_waybar_config: HOME is empty, skipping");
+        return;
+    }
+
+    // ── Waybar config directory ──
+    let waybar_dir = format!("{}/.config/waybar", home);
+    let waybar_path = std::path::Path::new(&waybar_dir);
+    if waybar_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        info!(path = %waybar_dir, "removing waybar config symlink");
+        let _ = std::fs::remove_file(&waybar_dir);
+    }
+    if waybar_path.is_dir() {
+        info!(path = %waybar_dir, "removing existing waybar config dir");
+        let _ = std::fs::remove_dir_all(&waybar_dir);
+    }
+    if let Err(err) = std::fs::create_dir_all(&waybar_dir) {
+        warn!(?err, dir = %waybar_dir, "failed to create waybar config dir");
+        return;
+    }
+
+    let config_path = format!("{}/config", waybar_dir);
+    info!(path = %config_path, "writing waybar config from asset");
+    let _ = std::fs::write(&config_path, include_str!("../assets/waybar-config.json"));
+
+    let style_path = format!("{}/style.css", waybar_dir);
+    info!(path = %style_path, "writing waybar style.css from asset");
+    let _ = std::fs::write(&style_path, include_str!("../assets/waybar-style.css"));
+
+    let colors_path = format!("{}/colors.css", waybar_dir);
+    info!(path = %colors_path, "writing bootstrap colors.css");
+    let _ = std::fs::write(&colors_path, r#"/* Bootstrap colors — overwritten by rc.lua write_theme_css() */
+@define-color bg_color #1a1b26;
+@define-color bg_alt_color #24283b;
+@define-color bg_surface_color #292e42;
+@define-color fg_color #c0caf5;
+@define-color fg_dim_color #565f89;
+@define-color fg_bright_color #e0e6ff;
+@define-color accent_color #7aa2f7;
+@define-color accent2_color #bb9af7;
+@define-color accent3_color #ff007c;
+@define-color green_color #73daca;
+@define-color red_color #f7768e;
+@define-color orange_color #ff9e64;
+@define-color yellow_color #e0af68;
+@define-color cyan_color #7dcfff;
+@define-color teal_color #2ac3de;
+@define-color magenta_color #c678dd;
+@define-color pink_color #ff79c6;
+@define-color urgent_color #db4b4b;
+@define-color success_color #9ece6a;
+@define-color warning_color #e0af68;
+@define-color active_border #7aa2f7;
+@define-color inactive_border #1a1b26;
+@define-color bar_bg_color rgba(26, 27, 38, 0.92);
+@define-color accent_hover rgba(122, 162, 247, 0.15);
+@define-color accent_subtle rgba(122, 162, 247, 0.10);
+@define-color accent_border rgba(122, 162, 247, 0.30);
+@define-color red_hover rgba(247, 118, 142, 0.20);
+@define-color red_subtle rgba(247, 118, 142, 0.10);
+@define-color orange_hover rgba(255, 158, 100, 0.18);
+@define-color green_subtle rgba(115, 218, 202, 0.10);
+@define-color separator_color rgba(59, 66, 97, 0.50);
+@define-color border_glow rgba(122, 162, 247, 0.35);
+"#);
+
+    // ── Deploy mywm scripts ──
+    let scripts_dir = format!("{}/.config/mywm/scripts", home);
+    if let Err(err) = std::fs::create_dir_all(&scripts_dir) {
+        warn!(?err, dir = %scripts_dir, "failed to create mywm scripts dir");
+        return;
+    }
+
+    let opacity_sh = format!("{}/mywm-opacity.sh", scripts_dir);
+    info!(path = %opacity_sh, "writing mywm-opacity.sh");
+    let _ = std::fs::write(&opacity_sh, include_str!("../assets/mywm-opacity.sh"));
+    set_executable(&opacity_sh);
+
+    let opacity_control_sh = format!("{}/mywm-opacity-control.sh", scripts_dir);
+    info!(path = %opacity_control_sh, "writing mywm-opacity-control.sh");
+    let _ = std::fs::write(&opacity_control_sh, include_str!("../assets/mywm-opacity-control.sh"));
+    set_executable(&opacity_control_sh);
+
+    let workspaces_sh = format!("{}/mywm-workspaces.sh", scripts_dir);
+    info!(path = %workspaces_sh, "writing mywm-workspaces.sh");
+    let _ = std::fs::write(&workspaces_sh, include_str!("../assets/mywm-workspaces.sh"));
+    set_executable(&workspaces_sh);
+
+    // ── Clean stale waybar config from real HOME ──
+    if let Ok(real_home) = std::env::var("MYWM_REAL_HOME") {
+        let real_waybar_dir = format!("{}/.config/waybar", real_home);
+        let real_waybar_path = std::path::Path::new(&real_waybar_dir);
+        if real_waybar_path.is_dir() {
+            info!(path = %real_waybar_dir, "cleaning stale waybar config from real HOME");
+            let _ = std::fs::remove_dir_all(&real_waybar_dir);
+        }
+    }
+
+    info!(waybar_dir = %waybar_dir, "waybar config deployed");
+}
+
+// -------------------------------------------------------------------------
+// DRM backend init
 // -------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -899,7 +936,7 @@ smithay::backend::renderer::element::render_elements! {
 }
 
 // -------------------------------------------------------------------------
-// Render frame — Phase 29: alpha, glow, opacity
+// Render frame
 // -------------------------------------------------------------------------
 
 fn render_frame(data: &mut CalloopData) {
@@ -932,9 +969,6 @@ fn render_frame(data: &mut CalloopData) {
     all_elements.push(OutputRenderElements::Cursor(cursor_elem));
 
     if state.workspace_transition.active {
-        // ════════════════════════════════════════════════════════
-        // ANIMATED: Render both workspaces with X offsets
-        // ════════════════════════════════════════════════════════
         let transition = state.workspace_transition.clone();
         let from_offset = transition.from_offset(screen_width);
         let to_offset = transition.to_offset(screen_width);
@@ -942,10 +976,10 @@ fn render_frame(data: &mut CalloopData) {
         let to_ws = transition.to_workspace;
 
         // "from" workspace
-        let from_space = &state.workspaces[from_ws].space;
+                let from_space = &state.workspaces[from_ws].space;
         let from_spaces = [from_space];
         if let Ok(from_elements) = space_render_elements(
-            &mut state.renderer, from_spaces, &state.output, 1.0,
+            &mut state.renderer, from_spaces, &state.output, global_opacity,
         ) {
             let from_borders = build_border_and_glow_elements(
                 &state.workspaces[from_ws], border_width, &focused_surface,
@@ -957,7 +991,6 @@ fn render_frame(data: &mut CalloopData) {
             all_elements.extend(from_borders);
         }
 
-        // Dying windows from "from" workspace
         all_elements.extend(build_dying_window_elements(
             &state.workspaces[from_ws], now, from_offset, global_opacity,
         ));
@@ -966,7 +999,7 @@ fn render_frame(data: &mut CalloopData) {
         let to_space = &state.workspaces[to_ws].space;
         let to_spaces = [to_space];
         if let Ok(to_elements) = space_render_elements(
-            &mut state.renderer, to_spaces, &state.output, 1.0,
+            &mut state.renderer, to_spaces, &state.output, global_opacity,
         ) {
             let to_borders = build_border_and_glow_elements(
                 &state.workspaces[to_ws], border_width, &focused_surface,
@@ -978,38 +1011,23 @@ fn render_frame(data: &mut CalloopData) {
             all_elements.extend(to_borders);
         }
 
-        // Dying windows from "to" workspace
         all_elements.extend(build_dying_window_elements(
             &state.workspaces[to_ws], now, to_offset, global_opacity,
         ));
-    } else {
-        // ════════════════════════════════════════════════════════
-        // STATIC: Normal single-workspace render
-        // ════════════════════════════════════════════════════════
+        } else {
         let active_ws_idx = state.active_workspace;
         let active_space = &state.workspaces[active_ws_idx].space;
         let spaces = [active_space];
-        match space_render_elements(&mut state.renderer, spaces, &state.output, 1.0) {
+        match space_render_elements(&mut state.renderer, spaces, &state.output, global_opacity) {
             Ok(space_elements) => {
-                // Note: space_render_elements produces elements with the alpha
-                // baked into textures. We apply our alpha multiplier via the
-                // border/glow system and the SolidColorRenderElement alpha param.
-                // For true per-window texture alpha, we would need a custom
-                // RenderElement wrapper. Instead we use SolidColorRenderElement
-                // overlays for fade-in/opacity (see below).
-
                 let border_elements = build_border_and_glow_elements(
                     &state.workspaces[active_ws_idx], border_width,
                     &focused_surface, &active_color, &inactive_color, 0, now,
                     global_opacity,
                 );
 
-                // Push borders BEHIND windows (they go into the element list
-                // after space elements, which means lower z-order).
                 all_elements.extend(border_elements);
 
-                // Fade-in overlay: for spawning windows, render a semi-transparent
-                // overlay that fades from the clear color to transparent.
                 let fade_in_overlays = build_fade_in_overlays(
                     &state.workspaces[active_ws_idx], now, global_opacity,
                     &state.config.clear_color,
@@ -1026,7 +1044,6 @@ fn render_frame(data: &mut CalloopData) {
             }
         }
 
-        // Dying windows (fade-out)
         all_elements.extend(build_dying_window_elements(
             &state.workspaces[active_ws_idx], now, 0, global_opacity,
         ));
@@ -1102,19 +1119,15 @@ fn render_frame(data: &mut CalloopData) {
 }
 
 // -------------------------------------------------------------------------
-// Phase 29: Border + Glow rendering
+// Border + Glow rendering
 // -------------------------------------------------------------------------
 
-/// Glow configuration: number of layers, expansion per layer, alpha per layer.
 const GLOW_LAYERS: &[(i32, f32)] = &[
     (2, 0.35),
     (4, 0.18),
     (6, 0.07),
 ];
 
-/// Build border elements for all windows in a workspace.
-/// Active window gets a multi-layered glow effect.
-/// Inactive windows get a flat border.
 fn build_border_and_glow_elements(
     ws: &Workspace,
     border_width: i32,
@@ -1147,7 +1160,6 @@ fn build_border_and_glow_elements(
             .map(|t| focused_surface.as_ref() == Some(t.wl_surface()))
             .unwrap_or(false);
 
-        // ── Calculate per-window alpha (fade-in + global opacity) ──
         let spawn_alpha = ws.spawn_times.get(window)
             .and_then(|t| animation_progress(now, *t))
             .map(animation_alpha)
@@ -1155,14 +1167,8 @@ fn build_border_and_glow_elements(
         let window_alpha = spawn_alpha * global_opacity;
 
         if is_focused {
-            // ═══════════════════════════════════════════════════
-            // ACTIVE WINDOW: Multi-layered glow effect
-            // ═══════════════════════════════════════════════════
-
-            // First render glow layers (outermost first = lowest z-order)
             for &(expansion, layer_alpha) in GLOW_LAYERS.iter().rev() {
                 let glow_alpha = layer_alpha * window_alpha;
-                // SolidColorBuffer uses premultiplied alpha
                 let color = [
                     active_color[0] * glow_alpha,
                     active_color[1] * glow_alpha,
@@ -1175,7 +1181,6 @@ fn build_border_and_glow_elements(
                 let gw = geo.size.w + 2 * bw + 2 * expansion;
                 let gh = geo.size.h + 2 * bw + 2 * expansion;
 
-                // Top glow strip
                 let buf = SolidColorBuffer::new((gw, expansion + bw), color);
                 let elem = SolidColorRenderElement::from_buffer(
                     &buf, Point::<i32, Physical>::from((gx, gy)),
@@ -1183,7 +1188,6 @@ fn build_border_and_glow_elements(
                 );
                 elements.push(OutputRenderElements::Cursor(elem));
 
-                // Bottom glow strip
                 let buf = SolidColorBuffer::new((gw, expansion + bw), color);
                 let elem = SolidColorRenderElement::from_buffer(
                     &buf,
@@ -1192,7 +1196,6 @@ fn build_border_and_glow_elements(
                 );
                 elements.push(OutputRenderElements::Cursor(elem));
 
-                // Left glow strip
                 let inner_h = gh - 2 * (expansion + bw);
                 if inner_h > 0 {
                     let buf = SolidColorBuffer::new((expansion + bw, inner_h), color);
@@ -1204,7 +1207,6 @@ fn build_border_and_glow_elements(
                     elements.push(OutputRenderElements::Cursor(elem));
                 }
 
-                // Right glow strip
                 if inner_h > 0 {
                     let buf = SolidColorBuffer::new((expansion + bw, inner_h), color);
                     let elem = SolidColorRenderElement::from_buffer(
@@ -1219,7 +1221,6 @@ fn build_border_and_glow_elements(
                 }
             }
 
-            // Then the solid border on top of glow
             let a = active_color[3] * window_alpha;
             let border_color = [
                 active_color[0] * a,
@@ -1232,10 +1233,7 @@ fn build_border_and_glow_elements(
                 bw, x_offset, &border_color,
             );
         } else {
-            // ═══════════════════════════════════════════════════
-            // INACTIVE WINDOW: Flat border
-            // ═══════════════════════════════════════════════════
-             let a = inactive_color[3] * window_alpha;
+            let a = inactive_color[3] * window_alpha;
             let border_color = [
                 inactive_color[0] * a,
                 inactive_color[1] * a,
@@ -1252,7 +1250,6 @@ fn build_border_and_glow_elements(
     elements
 }
 
-/// Render a flat 4-sided border around a window.
 fn render_flat_border(
     elements: &mut Vec<OutputRenderElements>,
     loc: Point<i32, Logical>,
@@ -1267,7 +1264,6 @@ fn render_flat_border(
     let outer_w = win_w + 2 * bw;
     let outer_h = win_h + 2 * bw;
 
-    // Top
     let buf = SolidColorBuffer::new((outer_w, bw), *color);
     let elem = SolidColorRenderElement::from_buffer(
         &buf, Point::<i32, Physical>::from((outer_x, outer_y)),
@@ -1275,7 +1271,6 @@ fn render_flat_border(
     );
     elements.push(OutputRenderElements::Cursor(elem));
 
-    // Bottom
     let buf = SolidColorBuffer::new((outer_w, bw), *color);
     let elem = SolidColorRenderElement::from_buffer(
         &buf, Point::<i32, Physical>::from((outer_x, outer_y + outer_h - bw)),
@@ -1283,7 +1278,6 @@ fn render_flat_border(
     );
     elements.push(OutputRenderElements::Cursor(elem));
 
-    // Left
     let buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), *color);
     let elem = SolidColorRenderElement::from_buffer(
         &buf, Point::<i32, Physical>::from((outer_x, outer_y + bw)),
@@ -1291,7 +1285,6 @@ fn render_flat_border(
     );
     elements.push(OutputRenderElements::Cursor(elem));
 
-    // Right
     let buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), *color);
     let elem = SolidColorRenderElement::from_buffer(
         &buf,
@@ -1302,18 +1295,15 @@ fn render_flat_border(
 }
 
 // -------------------------------------------------------------------------
-// Phase 29: Fade-in overlays
+// Fade-in overlays
 // -------------------------------------------------------------------------
 
-/// For windows currently in their spawn animation, render a semi-transparent
-/// overlay of the clear color that fades from opaque to transparent.
-/// This creates the illusion of the window fading in.
 fn build_fade_in_overlays(
     ws: &Workspace,
     now: Instant,
     global_opacity: f32,
     clear_color_hex: &str,
-) -> Vec<OutputRenderElements> {
+    ) -> Vec<OutputRenderElements> {
     let mut elements = Vec::new();
     let clear = crate::config::parse_hex_color(clear_color_hex);
 
@@ -1322,11 +1312,10 @@ fn build_fade_in_overlays(
             continue;
         };
         let Some(progress) = animation_progress(now, *spawn_time) else {
-            continue; // Animation complete
+            continue;
         };
 
         let alpha = animation_alpha(progress);
-        // Overlay alpha: fully opaque at start (1.0), fully transparent at end (0.0)
         let overlay_alpha = (1.0 - alpha) * global_opacity;
         if overlay_alpha < 0.01 {
             continue;
@@ -1340,7 +1329,7 @@ fn build_fade_in_overlays(
             continue;
         }
 
-                let color = [clear[0], clear[1], clear[2], overlay_alpha];
+        let color = [clear[0], clear[1], clear[2], overlay_alpha];
         let buf = SolidColorBuffer::new((geo.size.w, geo.size.h), color);
         let elem = SolidColorRenderElement::from_buffer(
             &buf,
@@ -1356,12 +1345,9 @@ fn build_fade_in_overlays(
 }
 
 // -------------------------------------------------------------------------
-// Phase 29: Dying window fade-out elements
+// Dying window fade-out elements
 // -------------------------------------------------------------------------
 
-/// Render dying windows as fading-out solid color rectangles.
-/// Since the actual window surface is already destroyed, we render
-/// a colored rectangle at the last known position that fades to transparent.
 fn build_dying_window_elements(
     ws: &Workspace,
     now: Instant,
@@ -1372,7 +1358,7 @@ fn build_dying_window_elements(
 
     for dw in &ws.dying_windows {
         let Some(fade_alpha) = dw.fade_alpha(now) else {
-            continue; // Animation complete, will be reaped
+            continue;
         };
 
         let alpha = fade_alpha * global_opacity;
@@ -1385,8 +1371,6 @@ fn build_dying_window_elements(
         let x = dw.last_location.x + x_offset;
         let y = dw.last_location.y;
 
-        // Render a semi-transparent overlay that matches the window's last area.
-        // Use a neutral dark color so it looks like the window is fading away.
         let color = [0.15, 0.12, 0.20, alpha * 0.7];
         let buf = SolidColorBuffer::new((w, h), color);
         let elem = SolidColorRenderElement::from_buffer(
@@ -1398,13 +1382,11 @@ fn build_dying_window_elements(
         );
         elements.push(OutputRenderElements::Cursor(elem));
 
-        // Add a brighter border around the dying window for a "dissolve" look
         let border_alpha = alpha * 0.3;
         if border_alpha > 0.01 {
             let border_color = [0.5, 0.5, 0.6, border_alpha];
             let bw = 2;
 
-            // Top
             let buf = SolidColorBuffer::new((w + 2 * bw, bw), border_color);
             let elem = SolidColorRenderElement::from_buffer(
                 &buf,
@@ -1413,16 +1395,14 @@ fn build_dying_window_elements(
             );
             elements.push(OutputRenderElements::Cursor(elem));
 
-            // Bottom
             let buf = SolidColorBuffer::new((w + 2 * bw, bw), border_color);
             let elem = SolidColorRenderElement::from_buffer(
                 &buf,
                 Point::<i32, Physical>::from((x - bw, y + h)),
                 1.0, 1.0, Kind::Unspecified,
             );
-            elements.push(OutputRenderElements::Cursor(elem));
+                        elements.push(OutputRenderElements::Cursor(elem));
 
-            // Left
             let buf = SolidColorBuffer::new((bw, h), border_color);
             let elem = SolidColorRenderElement::from_buffer(
                 &buf,
@@ -1431,7 +1411,6 @@ fn build_dying_window_elements(
             );
             elements.push(OutputRenderElements::Cursor(elem));
 
-            // Right
             let buf = SolidColorBuffer::new((bw, h), border_color);
             let elem = SolidColorRenderElement::from_buffer(
                 &buf,
@@ -1446,7 +1425,7 @@ fn build_dying_window_elements(
 }
 
 // -------------------------------------------------------------------------
-// Element relocation helper (unchanged)
+// Element relocation helper
 // -------------------------------------------------------------------------
 
 fn relocate_space_element(
@@ -1466,7 +1445,7 @@ fn relocate_space_element(
 }
 
 // -------------------------------------------------------------------------
-// Hex color parser (unchanged)
+// Hex color parser
 // -------------------------------------------------------------------------
 
 fn parse_hex_color(hex: &str) -> [f32; 4] {
@@ -1486,7 +1465,7 @@ fn parse_hex_color(hex: &str) -> [f32; 4] {
 }
 
 // -------------------------------------------------------------------------
-// DRM event handler (unchanged)
+// DRM event handler
 // -------------------------------------------------------------------------
 
 fn handle_drm_event(event: DrmEvent, data: &mut CalloopData) {

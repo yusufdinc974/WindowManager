@@ -47,15 +47,16 @@
     },
 
     "custom/opacity": {
-        "exec": "f=${XDG_RUNTIME_DIR:-/tmp}/mywm-opacity.json; if [ -f \"$f\" ]; then cat \"$f\"; else echo '{\"text\":\"100%\",\"tooltip\":\"Window Opacity\\nScroll: adjust | Click: reset\"}'; fi",
-        "return-type": "json",
         "interval": 1,
+        "exec": "cat ${XDG_RUNTIME_DIR:-/tmp}/mywm-opacity.json 2>/dev/null || echo '{\"text\":\"100%\",\"tooltip\":\"Opacity\",\"percentage\":100}'",
+        "return-type": "json",
         "format": "OP {}",
         "tooltip": true,
-        "on-scroll-up": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'{\\\"AdjustOpacity\\\":{\\\"value\\\":0.05}}'); s.close()\"",
-        "on-scroll-down": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'{\\\"AdjustOpacity\\\":{\\\"value\\\":-0.05}}'); s.close()\"",
-        "on-click": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'{\\\"SetOpacity\\\":{\\\"value\\\":1.0}}'); s.close()\"",
-        "on-click-right": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'{\\\"SetOpacity\\\":{\\\"value\\\":0.5}}'); s.close()\""
+        "on-click": "bash $HOME/.config/mywm/scripts/mywm-opacity-control.sh",
+        "on-click-right": "python3 -c \"import socket,json;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect('/tmp/mywm.sock');s.sendall(json.dumps({'SetOpacity':{'value':1.0}}).encode());s.close()\"",
+        "on-scroll-up": "python3 -c \"import socket,json;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect('/tmp/mywm.sock');s.sendall(json.dumps({'AdjustOpacity':{'value':0.05}}).encode());s.close()\"",
+        "on-scroll-down": "python3 -c \"import socket,json;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect('/tmp/mywm.sock');s.sendall(json.dumps({'AdjustOpacity':{'value':-0.05}}).encode());s.close()\"",
+        "escape": false
     },
 
     "clock": {

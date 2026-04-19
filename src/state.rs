@@ -745,11 +745,11 @@ impl State {
         let path = opacity_ipc_path();
         let pct = (self.window_opacity * 100.0).round() as i32;
         let json = format!(
-            r#"{{"text": "{}%", "tooltip": "Window Opacity: {}%\nScroll: adjust | Click: reset | Right-click: 50%", "class": "opacity", "percentage": {}}}"#,
+            r#"{{"text":"{}%","tooltip":"Window Opacity: {}%\nClick: slider | Scroll: adjust | Right-click: reset","class":"opacity","percentage":{}}}"#,
             pct, pct, pct
         );
         let tmp = format!("{}.tmp", path);
-        if let Ok(()) = std::fs::write(&tmp, &json) {
+        if let Ok(()) = std::fs::write(&tmp, format!("{}\n", json)) {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
