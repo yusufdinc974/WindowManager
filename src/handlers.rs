@@ -1,6 +1,7 @@
 //! Smithay protocol handler implementations for `State`.
 use smithay::reexports::wayland_server::Resource;
 
+
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
@@ -95,7 +96,7 @@ impl CompositorHandler for State {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
-    fn commit(&mut self, surface: &WlSurface) {
+        fn commit(&mut self, surface: &WlSurface) {
         debug!(surface = ?surface.id(), "commit() called");
 
         on_commit_buffer_handler::<Self>(surface);
@@ -119,18 +120,38 @@ impl CompositorHandler for State {
 
         handle_initial_configure_all(surface, &self.workspaces);
 
-        let (layer_commit, focus_target) = handle_layer_commit(surface, &self.output);
+        // ── Layer surface commit handling ──
+        let output = self.output.clone();
+
+        // Snapshot the usable area BEFORE the layer commit processes.
+        let old_non_exclusive = layer_map_for_output(&output).non_exclusive_zone();
+
+        let (layer_commit, focus_target) = handle_layer_commit(surface, &output);
+
         if layer_commit {
-            debug!("layer commit triggered retile");
-            let out = self.output.clone();
-            let outer = self.config.outer_gaps;
-            let inner = self.config.inner_gaps;
-            let border = self.config.border_width;
-            let focused = self.keyboard.current_focus();
-            for ws in self.workspaces.iter_mut() {
-                Self::recalculate_layout_for(ws, &out, outer, inner, border, focused.as_ref());
+            // Only retile if the exclusive zone actually changed
+            // (bar appeared, disappeared, or resized its exclusive area).
+            // Content-only repaints (clock, workspace highlight) skip this.
+            let new_non_exclusive = layer_map_for_output(&output).non_exclusive_zone();
+
+            if old_non_exclusive != new_non_exclusive {
+                debug!(
+                    ?old_non_exclusive,
+                    ?new_non_exclusive,
+                    "layer commit: exclusive zone changed — retiling all workspaces"
+                );
+                let outer = self.config.outer_gaps;
+                let inner = self.config.inner_gaps;
+                let border = self.config.border_width;
+                let focused = self.keyboard.current_focus();
+                for ws in self.workspaces.iter_mut() {
+                    Self::recalculate_layout_for(
+                        ws, &output, outer, inner, border, focused.as_ref(),
+                    );
+                }
             }
         }
+
         if let Some(target) = focus_target {
             let keyboard = self.keyboard.clone();
             if keyboard.current_focus().as_ref() != Some(&target) {
@@ -592,17 +613,16 @@ fn handle_layer_commit(
         }
     };
 
-    {
-        let mut map = layer_map_for_output(output);
-        map.arrange();
-    }
-
+    // Only call arrange() if there's a pending configure to process.
+    // Pure content repaints (clock, workspace indicator) don't need it.
     let configure_sent = layer.layer_surface().send_pending_configure().is_some();
     if configure_sent {
         debug!(
             surface = ?surface.id(),
-            "layer commit: sent configure (initial or size change)"
+            "layer commit: sent configure — rearranging layer map"
         );
+        let mut map = layer_map_for_output(output);
+        map.arrange();
     }
 
     let has_buffer = with_states(surface, |states| {

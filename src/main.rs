@@ -646,45 +646,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let waybar_dir = format!("{}/.config/waybar", home);
-        
+
         // If waybar dir is a symlink (from setup_isolated_home), remove it
         // and create a real directory so we control the config
         let waybar_path = std::path::Path::new(&waybar_dir);
-        if waybar_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        if waybar_path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
             info!(path = %waybar_dir, "removing waybar config symlink to write our own");
             let _ = std::fs::remove_file(&waybar_dir);
         }
-        
+
+        // Remove existing waybar dir entirely so we always write fresh
+        // copies from our compiled-in assets.
+        if waybar_path.is_dir() {
+            info!(path = %waybar_dir, "removing existing waybar config dir to write fresh assets");
+            let _ = std::fs::remove_dir_all(&waybar_dir);
+        }
+
         if let Err(err) = std::fs::create_dir_all(&waybar_dir) {
             warn!(?err, dir = %waybar_dir, "failed to create waybar config dir");
             return;
         }
 
-        // Always overwrite config to ensure it matches our compositor
+        // ── All from compiled-in assets ──
         let config_path = format!("{}/config", waybar_dir);
-        info!(path = %config_path, "writing waybar config");
+        info!(path = %config_path, "writing waybar config from asset");
         let _ = std::fs::write(&config_path, include_str!("../assets/waybar-config.json"));
 
         let style_path = format!("{}/style.css", waybar_dir);
-        info!(path = %style_path, "writing waybar style.css");
+        info!(path = %style_path, "writing waybar style.css from asset");
         let _ = std::fs::write(&style_path, include_str!("../assets/waybar-style.css"));
 
-        let script_dir = format!("{}/.config/mywm/scripts", home);
-        let _ = std::fs::create_dir_all(&script_dir);
+        // Write default colors.css so @import doesn't fail before rc.lua runs.
+        // rc.lua's write_theme_css() will overwrite this immediately on startup,
+        // but we need a valid file for the CSS parser.
+        let colors_path = format!("{}/colors.css", waybar_dir);
+        info!(path = %colors_path, "writing bootstrap colors.css");
+        let _ = std::fs::write(
+            &colors_path,
+            r#"/* Bootstrap colors — overwritten by rc.lua write_theme_css() */
+    /* Theme: tokyonight */
+    @define-color bg_color #1a1b26;
+    @define-color bg_alt_color #24283b;
+    @define-color bg_surface_color #292e42;
+    @define-color fg_color #c0caf5;
+    @define-color fg_dim_color #565f89;
+    @define-color fg_bright_color #e0e6ff;
+    @define-color accent_color #7aa2f7;
+    @define-color accent2_color #bb9af7;
+    @define-color accent3_color #ff007c;
+    @define-color green_color #73daca;
+    @define-color red_color #f7768e;
+    @define-color orange_color #ff9e64;
+    @define-color yellow_color #e0af68;
+    @define-color cyan_color #7dcfff;
+    @define-color teal_color #2ac3de;
+    @define-color magenta_color #c678dd;
+    @define-color pink_color #ff79c6;
+    @define-color urgent_color #db4b4b;
+    @define-color success_color #9ece6a;
+    @define-color warning_color #e0af68;
+    @define-color active_border #7aa2f7;
+    @define-color inactive_border #1a1b26;
+    @define-color bar_bg_color rgba(26, 27, 38, 0.92);
+    @define-color accent_hover rgba(122, 162, 247, 0.15);
+    @define-color accent_subtle rgba(122, 162, 247, 0.10);
+    @define-color accent_border rgba(122, 162, 247, 0.30);
+    @define-color red_hover rgba(247, 118, 142, 0.20);
+    @define-color red_subtle rgba(247, 118, 142, 0.10);
+    @define-color orange_hover rgba(255, 158, 100, 0.18);
+    @define-color green_subtle rgba(115, 218, 202, 0.10);
+    @define-color separator_color rgba(59, 66, 97, 0.50);
+    @define-color border_glow rgba(122, 162, 247, 0.35);
+    "#,
+        );
 
-        let script_path = format!("{}/mywm-workspaces.sh", script_dir);
-        info!(path = %script_path, "writing workspace script for waybar");
-        let _ = std::fs::write(&script_path, include_str!("../assets/mywm-workspaces.sh"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &script_path,
-                std::fs::Permissions::from_mode(0o755),
-            );
+        // Also clean the REAL home's waybar config so it doesn't interfere
+        if let Ok(real_home) = std::env::var("MYWM_REAL_HOME") {
+            let real_waybar_dir = format!("{}/.config/waybar", real_home);
+            let real_waybar_path = std::path::Path::new(&real_waybar_dir);
+            if real_waybar_path.is_dir() {
+                info!(path = %real_waybar_dir, "cleaning stale waybar config from real HOME");
+                let _ = std::fs::remove_dir_all(&real_waybar_dir);
+            }
         }
 
-        info!(waybar_dir = %waybar_dir, "waybar config ensured");
+        info!(waybar_dir = %waybar_dir, "waybar config deployed from compiled-in assets");
     }
 
     let state = State {

@@ -1,0 +1,48 @@
+# mywm configuration
+# Edit this file and press Super+Shift+R to reload.
+
+terminal = "alacritty"
+launcher = "fuzzel"
+
+outer_gaps = 15
+inner_gaps = 10
+border_width = 2
+
+active_border_color = "#7aa2f7"
+inactive_border_color = "#1a1b26"
+clear_color = "#14101e"
+
+workspace_names = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+# ── Keybindings ──
+# Each [[keybinds]] entry defines one shortcut.
+# Modifiers: logo (Super), shift, ctrl, alt
+# Action list: quit, reload_config, spawn_terminal, spawn_launcher,
+#   close_focused, toggle_fullscreen, cycle_layout, toggle_floating,
+#   focus_left, focus_right, move_window_left, move_window_right,
+#   cycle_theme, toggle_navbar, workspace_1..9, move_to_workspace_1..9
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "Escape"
+action = "quit"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "r"
+action = "reload_config"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "Return"
+action = "spawn_terminal"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "d"
+action = "spawn_launcher"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "q"
+action = "close_focused"

@@ -1,10 +1,9 @@
 //! Dual-format runtime configuration: TOML (simple) + Lua (advanced).
 //!
 //! Load order:
-//!   1. Built-in defaults
-//!   2. If `~/.config/mywm/config.toml` exists → load TOML overrides
-//!   3. If `~/.config/mywm/rc.lua` exists → run Lua (can override TOML)
-//!   4. Any missing field keeps its default
+//!   1. Deploy compiled-in assets to ~/.config/mywm/
+//!   2. Parse the deployed config.toml
+//!   3. Run the deployed rc.lua on top (can override TOML values)
 //!
 //! The Lua VM stays alive for the session so callbacks (cycle_theme,
 //! toggle_navbar) remain callable from keybinds.
@@ -20,10 +19,16 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 // -------------------------------------------------------------------------
+// Compiled-in assets — single source of truth
+// -------------------------------------------------------------------------
+
+const ASSET_DEFAULT_CONFIG_TOML: &str = include_str!("../assets/default_config.toml");
+const ASSET_DEFAULT_RC_LUA: &str = include_str!("../assets/default_rc.lua");
+
+// -------------------------------------------------------------------------
 // Keybinding types
 // -------------------------------------------------------------------------
 
-/// A modifier set for keybindings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Modifiers {
     #[serde(default)]
@@ -42,7 +47,6 @@ impl Default for Modifiers {
     }
 }
 
-/// A single keybinding definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Keybind {
     pub modifiers: Modifiers,
@@ -57,26 +61,22 @@ pub struct Keybind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    // ── Programs ──
     pub terminal: String,
     pub launcher: String,
-
-    // ── Appearance ──
     pub outer_gaps: i32,
     pub inner_gaps: i32,
     pub border_width: i32,
     pub active_border_color: String,
     pub inactive_border_color: String,
     pub clear_color: String,
-
-    // ── Workspaces ──
     pub workspace_names: Vec<String>,
-
-    // ── Keybindings ──
     #[serde(default = "default_keybinds")]
     pub keybinds: Vec<Keybind>,
 }
 
+/// Minimal hardcoded fallback — used ONLY by serde's #[serde(default)]
+/// to fill missing fields. Must NOT call toml::from_str to avoid
+/// infinite recursion.
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -117,7 +117,6 @@ fn default_keybinds() -> Vec<Keybind> {
         Keybind { modifiers: super_only.clone(), key: "Right".into(), action: "focus_right".into() },
         Keybind { modifiers: super_shift.clone(), key: "Left".into(), action: "move_window_left".into() },
         Keybind { modifiers: super_shift.clone(), key: "Right".into(), action: "move_window_right".into() },
-        // Workspace switching: Super+1..9
         Keybind { modifiers: super_only.clone(), key: "1".into(), action: "workspace_1".into() },
         Keybind { modifiers: super_only.clone(), key: "2".into(), action: "workspace_2".into() },
         Keybind { modifiers: super_only.clone(), key: "3".into(), action: "workspace_3".into() },
@@ -127,7 +126,6 @@ fn default_keybinds() -> Vec<Keybind> {
         Keybind { modifiers: super_only.clone(), key: "7".into(), action: "workspace_7".into() },
         Keybind { modifiers: super_only.clone(), key: "8".into(), action: "workspace_8".into() },
         Keybind { modifiers: super_only.clone(), key: "9".into(), action: "workspace_9".into() },
-        // Move to workspace: Super+Shift+1..9
         Keybind { modifiers: super_shift.clone(), key: "1".into(), action: "move_to_workspace_1".into() },
         Keybind { modifiers: super_shift.clone(), key: "2".into(), action: "move_to_workspace_2".into() },
         Keybind { modifiers: super_shift.clone(), key: "3".into(), action: "move_to_workspace_3".into() },
@@ -141,22 +139,78 @@ fn default_keybinds() -> Vec<Keybind> {
 }
 
 impl Config {
+    /// Parse the compiled-in asset TOML to produce the canonical defaults.
+    /// Falls back to Config::default() (hardcoded) if parsing fails.
+    fn from_asset() -> Self {
+        match toml::from_str::<Config>(ASSET_DEFAULT_CONFIG_TOML) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!(
+                    "BUG: failed to parse compiled-in default_config.toml: {err}. \
+                     Using minimal hardcoded defaults."
+                );
+                Self::default()
+            }
+        }
+    }
+
     pub fn workspace_count(&self) -> usize {
         self.workspace_names.len()
     }
 
-    /// Parse clear_color into [f32; 4].
     pub fn clear_color_f32(&self) -> [f32; 4] {
         parse_hex_color(&self.clear_color)
     }
 
-    /// Load configuration: TOML first, then Lua on top.
-    /// Returns the live Lua VM + parsed config.
-    pub fn load_from_lua() -> (Lua, Self) {
-        // Step 1: Start with defaults
-        let mut config = Self::default();
+    /// Deploy compiled-in asset files to the config directory.
+    fn deploy_assets() {
+        let Some(dir) = config_dir() else {
+            warn!("config: cannot resolve config dir — asset deploy skipped");
+            return;
+        };
 
-        // Step 2: Try loading TOML
+        if let Err(err) = fs::create_dir_all(&dir) {
+            warn!(?err, ?dir, "config: failed to create config dir");
+            return;
+        }
+
+        let toml_dest = dir.join("config.toml");
+        match fs::write(&toml_dest, ASSET_DEFAULT_CONFIG_TOML) {
+            Ok(()) => info!(?toml_dest, "config: deployed config.toml from asset"),
+            Err(err) => warn!(?err, ?toml_dest, "config: failed to write config.toml"),
+        }
+
+        let rc_dest = dir.join("rc.lua");
+        match fs::write(&rc_dest, ASSET_DEFAULT_RC_LUA) {
+            Ok(()) => info!(?rc_dest, "config: deployed rc.lua from asset"),
+            Err(err) => warn!(?err, ?rc_dest, "config: failed to write rc.lua"),
+        }
+
+        let script_dir = dir.join("scripts");
+        let _ = fs::create_dir_all(&script_dir);
+        let script_dest = script_dir.join("mywm-workspaces.sh");
+        match fs::write(&script_dest, include_str!("../assets/mywm-workspaces.sh")) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(
+                        &script_dest,
+                        fs::Permissions::from_mode(0o755),
+                    );
+                }
+                info!(?script_dest, "config: deployed mywm-workspaces.sh from asset");
+            }
+            Err(err) => warn!(?err, ?script_dest, "config: failed to write workspace script"),
+        }
+    }
+
+    /// Load configuration: deploy assets, parse TOML, then run Lua on top.
+    pub fn load_from_lua() -> (Lua, Self) {
+        Self::deploy_assets();
+
+        let mut config = Self::from_asset();
+
         if let Some(toml_path) = toml_path() {
             if toml_path.exists() {
                 match fs::read_to_string(&toml_path) {
@@ -166,34 +220,19 @@ impl Config {
                             config = toml_config;
                         }
                         Err(err) => {
-                            warn!(?toml_path, %err, "config: config.toml parse error, using defaults");
+                            warn!(
+                                ?toml_path, %err,
+                                "config: config.toml parse error, using asset defaults"
+                            );
                         }
                     },
                     Err(err) => {
                         warn!(?toml_path, ?err, "config: failed to read config.toml");
                     }
                 }
-            } else {
-                // Write a default config.toml on first boot
-                if let Some(dir) = toml_path.parent() {
-                    let _ = fs::create_dir_all(dir);
-                }
-                match toml::to_string_pretty(&config) {
-                    Ok(toml_str) => {
-                        if let Err(err) = fs::write(&toml_path, &toml_str) {
-                            warn!(?toml_path, ?err, "config: failed to write default config.toml");
-                        } else {
-                            info!(?toml_path, "config: wrote default config.toml");
-                        }
-                    }
-                    Err(err) => {
-                        warn!(%err, "config: failed to serialize default config to TOML");
-                    }
-                }
             }
         }
 
-        // Step 3: Lua VM (always created — needed for callbacks)
         let lua = unsafe { Lua::unsafe_new() };
 
         if let Err(err) = seed_wm_table(&lua, &config) {
@@ -201,27 +240,14 @@ impl Config {
             return (lua, config);
         }
 
-        // Step 4: Try loading rc.lua
         if let Some(path) = rc_path() {
-            if !path.exists() {
-                if let Some(dir) = path.parent() {
-                    let _ = fs::create_dir_all(dir);
-                }
-                if let Err(err) = fs::write(&path, DEFAULT_RC_LUA) {
-                    warn!(?path, ?err, "config: failed to write default rc.lua");
-                } else {
-                    info!(?path, "config: wrote default rc.lua");
-                }
-            }
-
             if path.exists() {
                 match fs::read_to_string(&path) {
                     Ok(source) => {
                         if let Err(err) = lua.load(&source).set_name("rc.lua").exec() {
-                            warn!(?path, error = %err, "config: rc.lua failed");
+                            warn!(?path, error = %err, "config: rc.lua execution failed");
                         } else {
                             info!(?path, "config: rc.lua loaded");
-                            // Read back any Lua overrides
                             match read_config_from_lua(&lua) {
                                 Ok(lua_config) => config = lua_config,
                                 Err(err) => {
@@ -240,7 +266,6 @@ impl Config {
         (lua, config)
     }
 
-    /// Re-read `wm.*` out of a live Lua VM.
     pub fn refresh_from_lua(&mut self, lua: &Lua) {
         match read_config_from_lua(lua) {
             Ok(new) => *self = new,
@@ -248,9 +273,9 @@ impl Config {
         }
     }
 
-    /// Reload both TOML and Lua from disk.
     pub fn reload(&mut self, lua: &Lua) {
-        // Re-read TOML
+        Self::deploy_assets();
+
         if let Some(toml_path) = toml_path() {
             if toml_path.exists() {
                 match fs::read_to_string(&toml_path) {
@@ -270,7 +295,6 @@ impl Config {
             }
         }
 
-        // Re-seed Lua with current config, then re-run rc.lua
         if let Err(err) = seed_wm_table(lua, self) {
             warn!(?err, "config: reload failed to seed wm table");
             return;
@@ -305,8 +329,6 @@ impl Config {
         );
     }
 
-    /// Build a lookup table from (modifiers, key_name) → action string
-    /// for fast keybinding dispatch.
     pub fn keybind_map(&self) -> HashMap<(bool, bool, bool, bool, String), String> {
         let mut map = HashMap::new();
         for kb in &self.keybinds {
@@ -324,7 +346,7 @@ impl Config {
 }
 
 // -------------------------------------------------------------------------
-// Hex color parser (reusable)
+// Hex color parser
 // -------------------------------------------------------------------------
 
 pub fn parse_hex_color(hex: &str) -> [f32; 4] {
@@ -381,19 +403,13 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
     let inner_gaps: i32 = get_or(&wm, "inner_gaps", defaults.inner_gaps);
     let border_width: i32 = get_or(&wm, "border_width", defaults.border_width);
     let active_border_color: String = get_or(
-        &wm,
-        "active_border_color",
-        defaults.active_border_color.clone(),
+        &wm, "active_border_color", defaults.active_border_color.clone(),
     );
     let inactive_border_color: String = get_or(
-        &wm,
-        "inactive_border_color",
-        defaults.inactive_border_color.clone(),
+        &wm, "inactive_border_color", defaults.inactive_border_color.clone(),
     );
     let clear_color: String = get_or(
-        &wm,
-        "clear_color",
-        defaults.clear_color.clone(),
+        &wm, "clear_color", defaults.clear_color.clone(),
     );
 
     let workspace_names = match wm.get::<_, Value>("workspace_names") {
@@ -407,11 +423,7 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
                     }
                 }
             }
-            if out.is_empty() {
-                defaults.workspace_names.clone()
-            } else {
-                out
-            }
+            if out.is_empty() { defaults.workspace_names.clone() } else { out }
         }
         _ => defaults.workspace_names.clone(),
     };
@@ -426,7 +438,7 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
         inactive_border_color,
         clear_color,
         workspace_names,
-        keybinds: defaults.keybinds, // Keybinds stay from TOML/defaults (Lua doesn't override)
+        keybinds: defaults.keybinds,
     })
 }
 
@@ -465,70 +477,3 @@ fn rc_path() -> Option<PathBuf> {
 fn toml_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
-
-// -------------------------------------------------------------------------
-// Default rc.lua
-// -------------------------------------------------------------------------
-
-const DEFAULT_RC_LUA: &str = r##"-- ============================================================
---  mywm — default rc.lua
---  ~/.config/mywm/rc.lua
--- ============================================================
-
-local w = wm
-
--- ── Theme palette ──
-local themes = {
-    { name = "tokyonight", active = "#7aa2f7", inactive = "#1a1b26" },
-    { name = "gruvbox",    active = "#fabd2f", inactive = "#3c3836" },
-    { name = "dracula",    active = "#bd93f9", inactive = "#44475a" },
-    { name = "catppuccin", active = "#f5c2e7", inactive = "#313244" },
-    { name = "nord",       active = "#88c0d0", inactive = "#2e3440" },
-}
-
-w.__theme_index = 1
-w.active_border_color   = themes[1].active
-w.inactive_border_color = themes[1].inactive
-
-function cycle_theme()
-    w.__theme_index = (w.__theme_index % #themes) + 1
-    local t = themes[w.__theme_index]
-    w.active_border_color   = t.active
-    w.inactive_border_color = t.inactive
-    print(string.format("theme -> %s  active=%s inactive=%s",
-          t.name, t.active, t.inactive))
-end
-
--- ── Navbar toggle ──
-w.__navbar_position = "top"
-w.__navbar_visible  = true
-
-function toggle_navbar()
-    if w.__navbar_visible then
-        os.execute("pkill -x waybar 2>/dev/null")
-        w.__navbar_visible = false
-        print("navbar -> hidden")
-    else
-        w.__navbar_position = (w.__navbar_position == "top")
-                              and "bottom" or "top"
-        os.execute("pkill -x waybar 2>/dev/null; sleep 0.2; setsid waybar &")
-        w.__navbar_visible = true
-        print("navbar -> " .. w.__navbar_position)
-    end
-end
-
-
-
--- ── Autostart ──
-w.autostart = {
-    "setsid waybar &",
-}
-
-print(string.format(
-    "rc.lua: %d workspaces, gaps %d/%d, border %dpx %s",
-    #w.workspace_names,
-    w.outer_gaps, w.inner_gaps,
-    w.border_width,
-    w.active_border_color
-))
-"##;
