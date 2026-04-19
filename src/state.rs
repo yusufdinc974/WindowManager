@@ -730,6 +730,21 @@ impl State {
         self.needs_redraw = true;
     }
 
+    /// Returns the effective render alpha for windows.
+    /// Uses a non-linear curve: opacity never goes below ~0.35 for readability.
+    /// At slider 50%, windows render at ~65% alpha (text stays readable).
+    /// At slider 20%, windows render at ~40% alpha.
+    pub fn effective_window_alpha(&self) -> f32 {
+        let t = self.window_opacity;
+        if t >= 0.99 {
+            return 1.0;
+        }
+        // Non-linear: floor of 0.15 + 0.85 * t^0.6
+        // This keeps text readable by never going fully transparent
+        let effective = 0.15 + 0.85 * t.powf(0.6);
+        effective.clamp(0.15, 1.0)
+    }
+
     pub fn adjust_window_opacity(&mut self, delta: f32) {
         let new = (self.window_opacity + delta).clamp(0.1, 1.0);
         self.window_opacity = new;

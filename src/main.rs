@@ -951,7 +951,7 @@ fn render_frame(data: &mut CalloopData) {
     let focused_surface = state.keyboard.current_focus();
     let active_color = crate::config::parse_hex_color(&state.config.active_border_color);
     let inactive_color = crate::config::parse_hex_color(&state.config.inactive_border_color);
-    let global_opacity = state.window_opacity;
+    let global_opacity = state.effective_window_alpha();
 
     let screen_width = state.workspaces[state.active_workspace]
         .space
@@ -1292,6 +1292,22 @@ fn render_flat_border(
         1.0, 1.0, Kind::Unspecified,
     );
     elements.push(OutputRenderElements::Cursor(elem));
+}
+
+
+// -------------------------------------------------------------------------
+// Layer-safe space render: excludes layer surfaces from opacity
+// -------------------------------------------------------------------------
+
+/// Check if a window is actually a layer surface (should not get opacity).
+/// Layer surfaces are managed separately and should always be fully opaque.
+fn is_layer_surface(state: &State, window: &Window) -> bool {
+    if let Some(toplevel) = window.toplevel() {
+        let surface = toplevel.wl_surface();
+        let map = layer_map_for_output(&state.output);
+        return map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).is_some();
+    }
+    false
 }
 
 // -------------------------------------------------------------------------
