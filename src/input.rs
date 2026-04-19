@@ -832,7 +832,7 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             }
         }
 
-        InputEvent::GestureSwipeEnd { event } => {
+                InputEvent::GestureSwipeEnd { event } => {
             if state.swipe_active {
                 let cancelled = event.cancelled();
                 debug!(
@@ -844,25 +844,25 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
                 if !cancelled {
                     let threshold = state.config.swipe_threshold;
                     if state.swipe_dx > threshold {
-                        // Swiped right → next workspace
+                        // Swiped right → previous workspace
                         info!(
                             swipe_dx = state.swipe_dx,
-                            "3-finger swipe right → workspace next"
+                            "3-finger swipe right → workspace prev"
+                        );
+                        let current = state.active_workspace;
+                        if current > 0 {
+                            state.switch_workspace(current - 1);
+                        }
+                    } else if state.swipe_dx < -threshold {
+                        // Swiped left → next workspace
+                        info!(
+                            swipe_dx = state.swipe_dx,
+                            "3-finger swipe left → workspace next"
                         );
                         let current = state.active_workspace;
                         let max = state.workspaces.len().saturating_sub(1);
                         if current < max {
                             state.switch_workspace(current + 1);
-                        }
-                    } else if state.swipe_dx < -threshold {
-                        // Swiped left → previous workspace
-                        info!(
-                            swipe_dx = state.swipe_dx,
-                            "3-finger swipe left → workspace prev"
-                        );
-                        let current = state.active_workspace;
-                        if current > 0 {
-                            state.switch_workspace(current - 1);
                         }
                     }
                 }
