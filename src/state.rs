@@ -391,6 +391,18 @@ impl State {
         self.needs_redraw = true;
     }
 
+     pub fn toggle_wallpaper_menu(&mut self) {
+        let call = self.lua.load(
+            "if type(toggle_wallpaper_menu) == 'function' then toggle_wallpaper_menu() \
+             else print('rc.lua: toggle_wallpaper_menu is not defined') end",
+        );
+        if let Err(err) = call.exec() {
+            warn!(error = %err, "toggle_wallpaper_menu: Lua execution failed");
+            return;
+        }
+        self.needs_redraw = true;
+    }
+
     /// Returns true if a layer surface currently holds keyboard focus.
     pub fn layer_has_keyboard_focus(&self) -> bool {
         let Some(focused) = self.keyboard.current_focus() else {

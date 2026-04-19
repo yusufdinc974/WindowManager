@@ -15,12 +15,6 @@ clear_color = "#14101e"
 workspace_names = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
 # ── Keybindings ──
-# Each [[keybinds]] entry defines one shortcut.
-# Modifiers: logo (Super), shift, ctrl, alt
-# Action list: quit, reload_config, spawn_terminal, spawn_launcher,
-#   close_focused, toggle_fullscreen, cycle_layout, toggle_floating,
-#   focus_left, focus_right, move_window_left, move_window_right,
-#   cycle_theme, toggle_navbar, workspace_1..9, move_to_workspace_1..9
 
 [[keybinds]]
 modifiers = { logo = true, shift = true }
@@ -46,3 +40,143 @@ action = "spawn_launcher"
 modifiers = { logo = true }
 key = "q"
 action = "close_focused"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "f"
+action = "toggle_fullscreen"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "space"
+action = "cycle_layout"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "space"
+action = "toggle_floating"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "t"
+action = "cycle_theme"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "b"
+action = "toggle_navbar"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "w"
+action = "toggle_wallpaper_menu"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "Left"
+action = "focus_left"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "Right"
+action = "focus_right"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "Left"
+action = "move_window_left"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "Right"
+action = "move_window_right"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "1"
+action = "workspace_1"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "2"
+action = "workspace_2"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "3"
+action = "workspace_3"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "4"
+action = "workspace_4"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "5"
+action = "workspace_5"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "6"
+action = "workspace_6"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "7"
+action = "workspace_7"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "8"
+action = "workspace_8"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "9"
+action = "workspace_9"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "1"
+action = "move_to_workspace_1"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "2"
+action = "move_to_workspace_2"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "3"
+action = "move_to_workspace_3"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "4"
+action = "move_to_workspace_4"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "5"
+action = "move_to_workspace_5"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "6"
+action = "move_to_workspace_6"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "7"
+action = "move_to_workspace_7"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "8"
+action = "move_to_workspace_8"
+
+[[keybinds]]
+modifiers = { logo = true, shift = true }
+key = "9"
+action = "move_to_workspace_9"

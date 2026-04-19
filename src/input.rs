@@ -57,6 +57,7 @@ pub enum KeyAction {
     MoveToWorkspace(usize),
     CycleTheme,
     ToggleNavbar,
+    ToggleWallpaperMenu,
     /// Intercepted but already handled inline by the keyboard filter.
     NoOp,
 }
@@ -129,6 +130,7 @@ fn action_string_to_key_action(action: &str) -> Option<KeyAction> {
         "move_window_right" => Some(KeyAction::MoveWindowRight),
         "cycle_theme" => Some(KeyAction::CycleTheme),
         "toggle_navbar" => Some(KeyAction::ToggleNavbar),
+        "toggle_wallpaper_menu" => Some(KeyAction::ToggleWallpaperMenu),
         s if s.starts_with("workspace_") => {
             s.strip_prefix("workspace_")
                 .and_then(|n| n.parse::<usize>().ok())
@@ -263,6 +265,9 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         }
         KeyAction::ToggleNavbar => {
             state.toggle_navbar();
+        }
+        KeyAction::ToggleWallpaperMenu => {       // <── NEW
+            state.toggle_wallpaper_menu();
         }
         KeyAction::NoOp => {}
     }

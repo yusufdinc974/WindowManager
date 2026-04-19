@@ -74,7 +74,6 @@ pub struct Config {
     pub keybinds: Vec<Keybind>,
     #[serde(default = "default_swipe_threshold")]
     pub swipe_threshold: f64,
-
 }
 
 fn default_swipe_threshold() -> f64 {
@@ -121,6 +120,7 @@ fn default_keybinds() -> Vec<Keybind> {
         Keybind { modifiers: super_shift.clone(), key: "space".into(), action: "toggle_floating".into() },
         Keybind { modifiers: super_only.clone(), key: "t".into(), action: "cycle_theme".into() },
         Keybind { modifiers: super_only.clone(), key: "b".into(), action: "toggle_navbar".into() },
+        Keybind { modifiers: super_only.clone(), key: "w".into(), action: "toggle_wallpaper_menu".into() },
         Keybind { modifiers: super_only.clone(), key: "Left".into(), action: "focus_left".into() },
         Keybind { modifiers: super_only.clone(), key: "Right".into(), action: "focus_right".into() },
         Keybind { modifiers: super_shift.clone(), key: "Left".into(), action: "move_window_left".into() },
@@ -182,6 +182,7 @@ impl Config {
             return;
         }
 
+        // ── Config files ──
         let toml_dest = dir.join("config.toml");
         match fs::write(&toml_dest, ASSET_DEFAULT_CONFIG_TOML) {
             Ok(()) => info!(?toml_dest, "config: deployed config.toml from asset"),
@@ -194,8 +195,11 @@ impl Config {
             Err(err) => warn!(?err, ?rc_dest, "config: failed to write rc.lua"),
         }
 
+        // ── Scripts directory ──
         let script_dir = dir.join("scripts");
         let _ = fs::create_dir_all(&script_dir);
+
+        // mywm-workspaces.sh
         let script_dest = script_dir.join("mywm-workspaces.sh");
         match fs::write(&script_dest, include_str!("../assets/mywm-workspaces.sh")) {
             Ok(()) => {
@@ -211,6 +215,53 @@ impl Config {
             }
             Err(err) => warn!(?err, ?script_dest, "config: failed to write workspace script"),
         }
+
+        // wallpaper-picker.sh
+        let picker_dest = script_dir.join("wallpaper-picker.sh");
+        match fs::write(&picker_dest, include_str!("../assets/wallpaper-picker.sh")) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(
+                        &picker_dest,
+                        fs::Permissions::from_mode(0o755),
+                    );
+                }
+                info!(?picker_dest, "config: deployed wallpaper-picker.sh from asset");
+            }
+            Err(err) => warn!(?err, ?picker_dest, "config: failed to write wallpaper picker script"),
+        }
+
+        // wallpaper-restore.sh
+        let restore_dest = script_dir.join("wallpaper-restore.sh");
+        match fs::write(&restore_dest, include_str!("../assets/wallpaper-restore.sh")) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(
+                        &restore_dest,
+                        fs::Permissions::from_mode(0o755),
+                    );
+                }
+                info!(?restore_dest, "config: deployed wallpaper-restore.sh from asset");
+            }
+            Err(err) => warn!(?err, ?restore_dest, "config: failed to write wallpaper restore script"),
+        }
+
+        // ── Wallpaper directories (one per theme) ──
+        let wallpapers_dir = dir.join("wallpapers");
+        for theme_name in &[
+            "tokyonight", "gruvbox", "everforest", "rosepine",
+            "kanagawa", "catppuccin", "dracula", "nord",
+        ] {
+            let theme_wp_dir = wallpapers_dir.join(theme_name);
+            if let Err(err) = fs::create_dir_all(&theme_wp_dir) {
+                warn!(?err, ?theme_wp_dir, "config: failed to create wallpaper theme dir");
+            }
+        }
+        info!(?wallpapers_dir, "config: ensured wallpaper directories exist");
     }
 
     /// Load configuration: deploy assets, parse TOML, then run Lua on top.

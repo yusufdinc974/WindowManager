@@ -238,10 +238,42 @@ w.__theme_index = 1
 w.active_border_color   = themes[1].active
 w.inactive_border_color = themes[1].inactive
 
--- ── Helper: resolve waybar config directory ──
+-- ── Helper: resolve the REAL home directory ──
+-- mywm sandboxes HOME under /run/user/<uid>/mywm-<id>/home/
+-- We detect this and resolve to the actual passwd home.
+local function real_home_dir()
+    local h = os.getenv("HOME") or ""
+    if h:match("/run/user/%d+/mywm%-.+/home") then
+        local handle = io.popen("getent passwd $(id -u) | cut -d: -f6 2>/dev/null")
+        if handle then
+            local real = handle:read("*l")
+            handle:close()
+            if real and real ~= "" then
+                return real
+            end
+        end
+    end
+    return h
+end
+
+-- ── Helper: get the session HOME (possibly sandboxed) ──
+-- Used for waybar config which lives in the sandbox
+local function session_home_dir()
+    return os.getenv("HOME") or ""
+end
+
+-- Waybar lives in the SANDBOXED home (compositor deploys it there)
 local function waybar_config_dir()
-    local home = os.getenv("HOME") or ""
-    return home .. "/.config/waybar"
+    return session_home_dir() .. "/.config/waybar"
+end
+
+-- Wallpapers and mywm config live in the REAL home
+local function mywm_config_dir()
+    return real_home_dir() .. "/.config/mywm"
+end
+
+local function mywm_cache_dir()
+    return real_home_dir() .. "/.cache/mywm"
 end
 
 -- ── Helper: hex "#rrggbb" → r, g, b integers ──
@@ -257,6 +289,28 @@ end
 local function hex_rgba(hex, alpha)
     local r, g, b = hex_to_rgb(hex)
     return string.format("rgba(%d, %d, %d, %.2f)", r, g, b, alpha)
+end
+
+-- ── Helper: check if a file exists ──
+local function file_exists(path)
+    local f = io.open(path, "r")
+    if f then
+        f:close()
+        return true
+    end
+    return false
+end
+
+-- ── Helper: read first line from a file ──
+local function read_file_line(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local line = f:read("*l")
+    f:close()
+    if line and line ~= "" then
+        return line
+    end
+    return nil
 end
 
 -- ── Write colors.css for the given theme ──
@@ -333,11 +387,11 @@ local function write_theme_css(t)
         hex_rgba(t.accent, 0.15),       -- accent_hover
         hex_rgba(t.accent, 0.10),       -- accent_subtle
         hex_rgba(t.accent, 0.30),       -- accent_border
-        hex_rgba(t.red, 0.20),          -- red_hover       (was 0.15, too faint)
+        hex_rgba(t.red, 0.20),          -- red_hover
         hex_rgba(t.red, 0.10),          -- red_subtle
         hex_rgba(t.orange, 0.18),       -- orange_hover
         hex_rgba(t.green, 0.10),        -- green_subtle
-        hex_rgba(t.separator, 0.50),    -- separator_color  (was 0.4, bumped)
+        hex_rgba(t.separator, 0.50),    -- separator_color
         hex_rgba(t.border_glow, 0.35)   -- border_glow
     )
 
@@ -352,13 +406,139 @@ local function write_theme_css(t)
 end
 
 -- ── Write initial theme CSS on startup ──
--- This may fail on first boot (waybar dir doesn't exist yet).
--- ensure_waybar_config() in the compositor will write a bootstrap
--- colors.css before waybar starts, so this is safe to skip.
 local ok, err = pcall(write_theme_css, themes[1])
 if not ok then
     print("theme: skipping initial write (waybar dir not ready yet — this is normal)")
 end
+
+-- ============================================================
+--  Wallpaper Engine
+-- ============================================================
+
+--- Apply a wallpaper via swaybg and cache the path.
+--- @param img_path string  Full path to the image file
+--- @param theme_name string  Theme name for per-theme caching
+local function apply_wallpaper(img_path, theme_name)
+    if not img_path or img_path == "" then return false end
+    if not file_exists(img_path) then
+        print("wallpaper: file not found — " .. img_path)
+        return false
+    end
+
+    -- Kill existing swaybg, launch new one
+    os.execute("pkill -x swaybg 2>/dev/null; sleep 0.1")
+    os.execute(string.format(
+        'swaybg -i "%s" -m fill &', img_path
+    ))
+
+    -- Write caches
+    local cache_dir = mywm_cache_dir()
+    os.execute('mkdir -p "' .. cache_dir .. '"')
+
+    -- Global cache
+    local gf = io.open(cache_dir .. "/current_wallpaper.txt", "w")
+    if gf then gf:write(img_path .. "\n"); gf:close() end
+
+    -- Per-theme cache
+    if theme_name and theme_name ~= "" then
+        local tf = io.open(cache_dir .. "/wallpaper_" .. theme_name .. ".txt", "w")
+        if tf then tf:write(img_path .. "\n"); tf:close() end
+    end
+
+    print(string.format("wallpaper: applied %s (theme: %s)", img_path, theme_name or "?"))
+    return true
+end
+
+--- Pick a random wallpaper from a theme's wallpaper directory.
+--- @param theme_name string
+--- @return string|nil  Full path to a random image, or nil if none found
+local function random_wallpaper_for_theme(theme_name)
+    local dir = mywm_config_dir() .. "/wallpapers/" .. theme_name
+    local handle = io.popen(
+        'find "' .. dir .. '" -maxdepth 1 -type f '
+        .. '\\( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" '
+        .. '-o -iname "*.webp" -o -iname "*.bmp" \\) 2>/dev/null'
+    )
+    if not handle then return nil end
+
+    local images = {}
+    for line in handle:lines() do
+        if line ~= "" then
+            images[#images + 1] = line
+        end
+    end
+    handle:close()
+
+    if #images == 0 then return nil end
+
+    math.randomseed(os.time() + os.clock() * 1000)
+    return images[math.random(#images)]
+end
+
+--- Restore wallpaper for a given theme (used on boot, reload, and theme switch).
+--- Priority: per-theme cache → random pick from theme dir.
+--- @param theme_name string
+local function restore_wallpaper_for_theme(theme_name)
+    if not theme_name or theme_name == "" then return end
+
+    local cache_dir = mywm_cache_dir()
+
+    -- 1. Per-theme cache
+    local theme_cache = cache_dir .. "/wallpaper_" .. theme_name .. ".txt"
+    local cached = read_file_line(theme_cache)
+    if cached and file_exists(cached) then
+        apply_wallpaper(cached, theme_name)
+        return
+    end
+
+    -- 2. Global cache (only if it belongs to this theme's directory)
+    local global_cache = cache_dir .. "/current_wallpaper.txt"
+    local global_cached = read_file_line(global_cache)
+    if global_cached then
+        local theme_dir_prefix = mywm_config_dir() .. "/wallpapers/" .. theme_name .. "/"
+        if global_cached:sub(1, #theme_dir_prefix) == theme_dir_prefix
+           and file_exists(global_cached) then
+            apply_wallpaper(global_cached, theme_name)
+            return
+        end
+    end
+
+    -- 3. Random pick
+    local random_img = random_wallpaper_for_theme(theme_name)
+    if random_img then
+        apply_wallpaper(random_img, theme_name)
+        return
+    end
+
+    print("wallpaper: no wallpapers available for theme '" .. theme_name .. "'")
+end
+
+-- ============================================================
+--  Wallpaper Picker (Super + W)
+-- ============================================================
+
+function current_theme_name()
+    return themes[w.__theme_index].name
+end
+
+
+function toggle_wallpaper_menu()
+    local theme_name = current_theme_name()
+    local script = mywm_config_dir() .. "/scripts/wallpaper-picker.sh"
+
+    if file_exists(script) then
+        os.execute(string.format(
+            'setsid "%s" "%s" &', script, theme_name
+        ))
+        print("wallpaper: opened picker for theme " .. theme_name)
+    else
+        print("wallpaper: picker script not found at " .. script)
+    end
+end
+
+-- ============================================================
+--  Theme Cycling (Super + T) — updated with wallpaper hook
+-- ============================================================
 
 function cycle_theme()
     w.__theme_index = (w.__theme_index % #themes) + 1
@@ -373,6 +553,9 @@ function cycle_theme()
 
     -- Hot-reload Waybar CSS (SIGUSR2 triggers CSS-only reload)
     os.execute("pkill -SIGUSR2 waybar 2>/dev/null")
+
+    -- ── Wallpaper: switch to theme-appropriate wallpaper ──
+    restore_wallpaper_for_theme(t.name)
 
     print(string.format("theme -> %s  active=%s inactive=%s",
           t.name, t.active, t.inactive))
@@ -397,8 +580,13 @@ function toggle_navbar()
 end
 
 -- ── Autostart ──
+-- Restore wallpaper for the initial theme on compositor boot
 w.autostart = {
     "/bin/bash -c 'exec waybar > /tmp/waybar-stderr.log 2>&1'",
+    string.format(
+        '/bin/bash -c "sleep 0.5; %s/scripts/wallpaper-restore.sh %s"',
+        mywm_config_dir(), themes[w.__theme_index].name
+    ),
 }
 
 print(string.format(
