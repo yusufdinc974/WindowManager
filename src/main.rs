@@ -1,5 +1,7 @@
 //! Phase 10+29: bare-metal Wayland compositor entry point.
 
+
+
 use std::{
     collections::HashSet,
     io::Read,
@@ -91,6 +93,7 @@ use state::{
 
 fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
     std::env::set_var("WAYLAND_DISPLAY", socket_name);
+    std::env::remove_var("WAYLAND_DEBUG");
     std::env::set_var("XDG_SESSION_TYPE", "wayland");
     std::env::set_var("XDG_CURRENT_DESKTOP", "mywm");
     std::env::set_var("XDG_SESSION_DESKTOP", "mywm");
@@ -268,11 +271,28 @@ fn cleanup_isolated_home() {
 // -------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+     // ── Phase 30: Kill libwayland wire protocol spam ──
+    std::env::remove_var("WAYLAND_DEBUG");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(
+                        "info,\
+                         smithay=warn,\
+                         calloop=warn,\
+                         wayland_server=warn,\
+                         wayland_commons=warn,\
+                         drm=warn,\
+                         gbm=warn,\
+                         input=warn"
+                    )
+                }),
         )
+        .compact()
+        .with_target(false)
         .init();
 
     info!("bootstrapping bare-metal Wayland compositor (Phase 10+29)");

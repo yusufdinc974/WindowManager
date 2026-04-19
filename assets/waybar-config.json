@@ -46,16 +46,16 @@
         "tooltip": false
     },
 
-        "custom/opacity": {
-        "exec": "f=${XDG_RUNTIME_DIR:-/tmp}/mywm-opacity.json; if [ -f \"$f\" ]; then cat \"$f\"; else echo '{\"text\":\"100%\",\"tooltip\":\"Opacity: 100%  Scroll to adjust\",\"percentage\":100}'; fi",
+    "custom/opacity": {
+        "exec": "f=${XDG_RUNTIME_DIR:-/tmp}/mywm-opacity.json; if [ -f \"$f\" ]; then cat \"$f\"; else echo '{\"text\":\"100%\",\"tooltip\":\"Window Opacity\\nScroll: adjust | Click: reset\"}'; fi",
         "return-type": "json",
         "interval": 1,
-        "format": "  {}",
+        "format": "OP {}",
         "tooltip": true,
-        "on-scroll-up": "~/.config/mywm/scripts/mywm-ipc.sh '{\"AdjustOpacity\":{\"value\":0.05}}'",
-        "on-scroll-down": "~/.config/mywm/scripts/mywm-ipc.sh '{\"AdjustOpacity\":{\"value\":-0.05}}'",
-        "on-click": "~/.config/mywm/scripts/mywm-ipc.sh '{\"SetOpacity\":{\"value\":1.0}}'",
-        "on-click-right": "~/.config/mywm/scripts/mywm-ipc.sh '{\"SetOpacity\":{\"value\":0.5}}'"
+        "on-scroll-up": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'{\\\"AdjustOpacity\\\":{\\\"value\\\":0.05}}'); s.close()\"",
+        "on-scroll-down": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'{\\\"AdjustOpacity\\\":{\\\"value\\\":-0.05}}'); s.close()\"",
+        "on-click": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'{\\\"SetOpacity\\\":{\\\"value\\\":1.0}}'); s.close()\"",
+        "on-click-right": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'{\\\"SetOpacity\\\":{\\\"value\\\":0.5}}'); s.close()\""
     },
 
     "clock": {
@@ -66,17 +66,11 @@
     },
 
     "pulseaudio": {
-        "format": "{icon} {volume}%",
-        "format-bluetooth": "  {volume}%",
-        "format-muted": "  muted",
+        "format": "VOL {volume}%",
+        "format-bluetooth": "BT {volume}%",
+        "format-muted": "MUTE",
         "format-icons": {
-            "headphone": " ",
-            "hands-free": " ",
-            "headset": " ",
-            "phone": " ",
-            "portable": " ",
-            "car": " ",
-            "default": [" ", " ", " "]
+            "default": [""]
         },
         "on-click": "pactl set-sink-mute @DEFAULT_SINK@ toggle",
         "on-click-right": "pavucontrol",
@@ -84,9 +78,9 @@
     },
 
     "network": {
-        "format-wifi": "󰤨  {signalStrength}%",
-        "format-ethernet": "  {ifname}",
-        "format-disconnected": "  offline",
+        "format-wifi": "WiFi {signalStrength}%",
+        "format-ethernet": "ETH {ifname}",
+        "format-disconnected": "OFFLINE",
         "tooltip-format-wifi": "{essid} ({signalStrength}%)\n{ipaddr}/{cidr}",
         "tooltip-format-ethernet": "{ifname}\n{ipaddr}/{cidr}",
         "tooltip-format-disconnected": "Disconnected",
@@ -99,16 +93,16 @@
             "warning": 30,
             "critical": 15
         },
-        "format": "{icon} {capacity}%",
-        "format-charging": "  {capacity}%",
-        "format-plugged": "  {capacity}%",
-        "format-icons": [" ", " ", " ", " ", " "],
+        "format": "BAT {capacity}%",
+        "format-charging": "CHG {capacity}%",
+        "format-plugged": "PLG {capacity}%",
+        "format-icons": [""],
         "tooltip-format": "{timeTo}\n{power:.1f}W"
     },
 
     "custom/power": {
-        "format": " ⏻ ",
+        "format": " QUIT ",
         "tooltip": false,
-        "on-click": "~/.config/mywm/scripts/mywm-ipc.sh '\"Quit\"'"
+        "on-click": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/mywm.sock'); s.sendall(b'\\\"Quit\\\"'); s.close()\""
     }
 }

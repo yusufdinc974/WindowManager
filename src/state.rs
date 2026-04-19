@@ -745,7 +745,7 @@ impl State {
         let path = opacity_ipc_path();
         let pct = (self.window_opacity * 100.0).round() as i32;
         let json = format!(
-            r#"{{"text": "{}%", "tooltip": "Window Opacity: {}%", "class": "opacity", "percentage": {}}}"#,
+            r#"{{"text": "{}%", "tooltip": "Window Opacity: {}%\nScroll: adjust | Click: reset | Right-click: 50%", "class": "opacity", "percentage": {}}}"#,
             pct, pct, pct
         );
         let tmp = format!("{}.tmp", path);

@@ -114,11 +114,12 @@ tooltip label {
 
 #custom-opacity {
     color: @cyan_color;
-    font-size: 12px;
-    padding: 0 10px;
-    min-width: 50px;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 0 14px;
+    min-width: 65px;
     border-radius: 12px;
-    background-color: alpha(@cyan_color, 0.06);
+    background-color: alpha(@cyan_color, 0.08);
     border-right: 1px solid @separator_color;
 }
 

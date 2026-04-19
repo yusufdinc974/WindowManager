@@ -36,3 +36,10 @@ thiserror = "1"
 
 [profile.dev]
 opt-level = 1
+
+[profile.release]
+opt-level = 3        # Maximum speed optimization
+lto = "fat"          # Full cross-crate link-time optimization
+codegen-units = 1    # Single codegen unit — best LLVM optimization
+strip = true         # Strip debug symbols — smaller binary
+panic = "abort"      # No unwinding overhead — smaller + faster
