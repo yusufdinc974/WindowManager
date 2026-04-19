@@ -67,6 +67,10 @@ pub enum IpcCommand {
     Quit,
     SpawnTerminal,
     CloseFocused,
+        /// Set absolute opacity (0.1 – 1.0)
+    SetOpacity(f32),
+    /// Adjust opacity by delta (e.g. +0.05 or -0.05)
+    AdjustOpacity(f32),
 }
 
 // -------------------------------------------------------------------------
@@ -266,7 +270,7 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         KeyAction::ToggleNavbar => {
             state.toggle_navbar();
         }
-        KeyAction::ToggleWallpaperMenu => {       // <── NEW
+        KeyAction::ToggleWallpaperMenu => {      
             state.toggle_wallpaper_menu();
         }
         KeyAction::NoOp => {}
@@ -900,6 +904,14 @@ pub fn handle_ipc_command(state: &mut State, cmd: IpcCommand) {
         IpcCommand::CloseFocused => {
             info!("IPC: close focused");
             state.close_focused();
+        }
+        IpcCommand::SetOpacity(val) => {
+            info!(opacity = val, "IPC: set opacity");
+            state.set_window_opacity(val);
+        }
+        IpcCommand::AdjustOpacity(delta) => {
+            info!(delta, "IPC: adjust opacity");
+            state.adjust_window_opacity(delta);
         }
     }
 }

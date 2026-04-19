@@ -1,7 +1,6 @@
 //! Smithay protocol handler implementations for `State`.
 use smithay::reexports::wayland_server::Resource;
 
-
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
@@ -27,7 +26,7 @@ use smithay::{
             Client,
         },
     },
-    utils::{Serial, SERIAL_COUNTER},
+    utils::{Point, Serial, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -60,7 +59,7 @@ use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
-use crate::state::{ClientState, State};
+use crate::state::{window_current_size, ClientState, DyingWindow, State};
 
 // -------------------------------------------------------------------------
 // SeatHandler
@@ -96,7 +95,7 @@ impl CompositorHandler for State {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
-        fn commit(&mut self, surface: &WlSurface) {
+    fn commit(&mut self, surface: &WlSurface) {
         debug!(surface = ?surface.id(), "commit() called");
 
         on_commit_buffer_handler::<Self>(surface);
@@ -122,16 +121,11 @@ impl CompositorHandler for State {
 
         // ── Layer surface commit handling ──
         let output = self.output.clone();
-
-        // Snapshot the usable area BEFORE the layer commit processes.
         let old_non_exclusive = layer_map_for_output(&output).non_exclusive_zone();
 
         let (layer_commit, focus_target) = handle_layer_commit(surface, &output);
 
         if layer_commit {
-            // Only retile if the exclusive zone actually changed
-            // (bar appeared, disappeared, or resized its exclusive area).
-            // Content-only repaints (clock, workspace highlight) skip this.
             let new_non_exclusive = layer_map_for_output(&output).non_exclusive_zone();
 
             if old_non_exclusive != new_non_exclusive {
@@ -336,6 +330,13 @@ impl XdgShellHandler for State {
 
         for (i, ws) in self.workspaces.iter_mut().enumerate() {
             let had_window = ws.windows.len();
+            // Find the window before removing it, to capture geometry for fade-out
+            let dying_window = ws
+                .windows
+                .iter()
+                .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&dying_surface))
+                .cloned();
+
             ws.windows
                 .retain(|w| w.toplevel().map(|t| t.wl_surface()) != Some(&dying_surface));
             ws.spawn_times
@@ -348,14 +349,35 @@ impl XdgShellHandler for State {
                 .retain(|w, _| w.toplevel().map(|t| t.wl_surface()) != Some(&dying_surface));
 
             if ws.windows.len() != had_window {
-                let dead = ws
-                    .space
-                    .elements()
-                    .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&dying_surface))
-                    .cloned();
-                if let Some(window) = dead {
+                // ── Phase 29: Record dying window for fade-out ──
+                if let Some(window) = dying_window {
+                    let last_location = ws
+                        .space
+                        .element_location(&window)
+                        .unwrap_or_else(|| Point::from((0, 0)));
+                    let last_size = window_current_size(&window)
+                        .map(|s| (s.w, s.h))
+                        .unwrap_or((100, 100));
+
+                    ws.dying_windows.push(DyingWindow {
+                        window: window.clone(),
+                        destroy_time: Instant::now(),
+                        last_location,
+                        last_size,
+                    });
+
                     ws.space.unmap_elem(&window);
+                } else {
+                    let dead = ws
+                        .space
+                        .elements()
+                        .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(&dying_surface))
+                        .cloned();
+                    if let Some(window) = dead {
+                        ws.space.unmap_elem(&window);
+                    }
                 }
+
                 info!(
                     workspace = i + 1,
                     remaining_windows = ws.windows.len(),
@@ -613,8 +635,6 @@ fn handle_layer_commit(
         }
     };
 
-    // Only call arrange() if there's a pending configure to process.
-    // Pure content repaints (clock, workspace indicator) don't need it.
     let configure_sent = layer.layer_surface().send_pending_configure().is_some();
     if configure_sent {
         debug!(

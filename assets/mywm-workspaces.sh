@@ -3,6 +3,9 @@
 # Reads workspace state from the compositor's IPC file and outputs
 # Waybar-compatible JSON.
 
+trap 'exit 0' PIPE TERM INT
+exec 2>/dev/null
+
 IPC_FILE="${XDG_RUNTIME_DIR:-/tmp}/mywm-workspaces.json"
 
 # Kanji labels for workspace indices

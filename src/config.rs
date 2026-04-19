@@ -250,6 +250,40 @@ impl Config {
             Err(err) => warn!(?err, ?restore_dest, "config: failed to write wallpaper restore script"),
         }
 
+        // mywm-ipc.sh
+        let ipc_dest = script_dir.join("mywm-ipc.sh");
+        match fs::write(&ipc_dest, include_str!("../assets/mywm-ipc.sh")) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(
+                        &ipc_dest,
+                        fs::Permissions::from_mode(0o755),
+                    );
+                }
+                info!(?ipc_dest, "config: deployed mywm-ipc.sh from asset");
+            }
+            Err(err) => warn!(?err, ?ipc_dest, "config: failed to write IPC script"),
+        }
+
+        // mywm-opacity.sh
+        let opacity_dest = script_dir.join("mywm-opacity.sh");
+        match fs::write(&opacity_dest, include_str!("../assets/mywm-opacity.sh")) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(
+                        &opacity_dest,
+                        fs::Permissions::from_mode(0o755),
+                    );
+                }
+                info!(?opacity_dest, "config: deployed mywm-opacity.sh from asset");
+            }
+            Err(err) => warn!(?err, ?opacity_dest, "config: failed to write opacity script"),
+        }
+
         // ── Wallpaper directories (one per theme) ──
         let wallpapers_dir = dir.join("wallpapers");
         for theme_name in &[

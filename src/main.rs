@@ -1,11 +1,11 @@
-//! Phase 10: bare-metal Wayland compositor entry point.
+//! Phase 10+29: bare-metal Wayland compositor entry point.
 
 use std::{
     collections::HashSet,
     io::Read,
     os::unix::net::UnixListener,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use smithay::{
@@ -82,30 +82,19 @@ mod state;
 use config::Config;
 use input::{handle_ipc_command, handle_libinput_event, IpcCommand};
 use state::{
-    CalloopData, ClientState, DrmBackend, State, Workspace,
+    animation_alpha, animation_progress, CalloopData, ClientState, DrmBackend, State, Workspace,
 };
 
 // -------------------------------------------------------------------------
-// Session environment isolation
+// Session environment isolation (unchanged)
 // -------------------------------------------------------------------------
-/// Forcibly configure the process environment so that every child process
-/// (terminals, browsers, launchers …) connects to OUR Wayland display and
-/// never falls back to an X11/Wayland session on another TTY.
-///
-/// This MUST run:
-///   1. AFTER the listening socket is created (so we know the socket name),
-///   2. BEFORE any `std::process::Command` spawn (autostart, terminals …).
+
 fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
-    // ── Core Wayland identity ──
     std::env::set_var("WAYLAND_DISPLAY", socket_name);
     std::env::set_var("XDG_SESSION_TYPE", "wayland");
     std::env::set_var("XDG_CURRENT_DESKTOP", "mywm");
     std::env::set_var("XDG_SESSION_DESKTOP", "mywm");
-
-    // ── Kill any X11 fallback path ──
     std::env::remove_var("DISPLAY");
-
-    // ── Per-toolkit Wayland enforcement ──
     std::env::set_var("MOZ_ENABLE_WAYLAND", "1");
     std::env::set_var("GDK_BACKEND", "wayland");
     std::env::set_var("QT_QPA_PLATFORM", "wayland");
@@ -114,60 +103,25 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
     std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
     std::env::set_var("CLUTTER_BACKEND", "wayland");
     std::env::set_var("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
-
-    // ── Accessibility bus suppression ──
     std::env::set_var("NO_AT_BRIDGE", "1");
     std::env::set_var("GTK_A11Y", "none");
 
-    // ── Session-unique identifier ──
-    // Used to isolate profile directories, DBus, etc.
     let session_id = format!("mywm-{}", std::process::id());
 
-    // ══════════════════════════════════════════════════════════════
-    //  FIREFOX / THUNDERBIRD ISOLATION
-    //
-    //  Firefox discovers running instances via a LOCK FILE inside
-    //  the profile directory (~/.mozilla/firefox/<profile>/lock).
-    //  Neither --no-remote nor MOZ_NO_REMOTE prevents the new
-    //  process from acting as a *client* that hands off to the
-    //  existing instance and exits.
-    //
-    //  The ONLY reliable fix: give this session its own profile
-    //  root so there is no shared lock file to discover.
-    // ══════════════════════════════════════════════════════════════
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        // Per-session Firefox profile root.
-        // Firefox will create a fresh "default" profile here on first launch.
         let moz_dir = format!("{}/{}/mozilla", runtime_dir, session_id);
         let tb_dir = format!("{}/{}/thunderbird", runtime_dir, session_id);
-
-        // Create the directories so Firefox doesn't error out.
         let _ = std::fs::create_dir_all(&moz_dir);
         let _ = std::fs::create_dir_all(&tb_dir);
-
-        // HOME/.mozilla → overridden by these env vars.
-        // Firefox checks these BEFORE falling back to ~/.mozilla.
         std::env::set_var("MOZ_LEGACY_PROFILES", "0");
         std::env::set_var("MOZ_NO_REMOTE", "1");
         std::env::set_var("MOZ_DBUS_REMOTE", "0");
 
-        // The actual isolation: point Firefox's profile root elsewhere.
-        // Firefox respects the -profile flag but NOT an env var for the
-        // profile *root*. However, we can override HOME for child
-        // processes so ~/.mozilla resolves to our isolated directory.
-        //
-        // We use a session-private HOME overlay approach:
         let isolated_home = format!("{}/{}/home", runtime_dir, session_id);
         let real_home = std::env::var("HOME").unwrap_or_default();
-
         let _ = std::fs::create_dir_all(&isolated_home);
-
-        // Symlink everything from real HOME except .mozilla and .thunderbird
         setup_isolated_home(&real_home, &isolated_home, &moz_dir, &tb_dir);
-
         std::env::set_var("HOME", &isolated_home);
-
-        // Preserve the real home for apps that need it (e.g. file dialogs).
         std::env::set_var("MYWM_REAL_HOME", &real_home);
 
         info!(
@@ -177,7 +131,6 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
         );
     }
 
-    // ── DBus session isolation ──
     match launch_private_dbus_session() {
         Ok(addr) => {
             std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &addr);
@@ -185,36 +138,18 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
         }
         Err(err) => {
             if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok() {
-                warn!(
-                    ?err,
-                    "session: failed to launch private DBus — keeping inherited bus address"
-                );
+                warn!(?err, "session: failed to launch private DBus — keeping inherited bus address");
             } else {
-                warn!(
-                    ?err,
-                    "session: no DBus session bus available — Waybar and other clients may fail to start"
-                );
+                warn!(?err, "session: no DBus session bus available");
             }
         }
     }
 
-    info!(
-        wayland_display = ?socket_name,
-        "session: environment variables locked to this compositor"
-    );
+    info!(wayland_display = ?socket_name, "session: environment variables locked to this compositor");
 }
 
-/// Create an isolated HOME directory that symlinks everything from the
-/// real HOME *except* browser profile directories, which get their own
-/// fresh copies so profile lock files don't collide across sessions.
-fn setup_isolated_home(
-    real_home: &str,
-    isolated_home: &str,
-    _moz_dir: &str,
-    _tb_dir: &str,
-) {
+fn setup_isolated_home(real_home: &str, isolated_home: &str, _moz_dir: &str, _tb_dir: &str) {
     let isolated_dirs = [".mozilla", ".thunderbird"];
-
     let real = std::path::Path::new(real_home);
     let iso = std::path::Path::new(isolated_home);
 
@@ -234,18 +169,13 @@ fn setup_isolated_home(
         if target.exists() || target.symlink_metadata().is_ok() {
             continue;
         }
-
         if isolated_dirs.iter().any(|d| name_str == *d) {
             continue;
         }
-
-        // For .config, make it a REAL directory and symlink its contents
-        // so we can write new files (like waybar config) into it
         if name_str == ".config" {
             let real_config = entry.path();
             let iso_config = iso.join(".config");
             let _ = std::fs::create_dir_all(&iso_config);
-
             if let Ok(config_entries) = std::fs::read_dir(&real_config) {
                 for ce in config_entries.flatten() {
                     let ce_name = ce.file_name();
@@ -257,31 +187,18 @@ fn setup_isolated_home(
             }
             continue;
         }
-
         if let Err(err) = std::os::unix::fs::symlink(entry.path(), &target) {
-            tracing::trace!(
-                ?err,
-                entry = %name_str,
-                "isolated home: failed to symlink"
-            );
+            tracing::trace!(?err, entry = %name_str, "isolated home: failed to symlink");
         }
     }
 
-    // Ensure isolated .mozilla and .thunderbird exist as real dirs
     let iso_moz_ff = iso.join(".mozilla").join("firefox");
     let _ = std::fs::create_dir_all(&iso_moz_ff);
-
     let iso_tb = iso.join(".thunderbird");
     let _ = std::fs::create_dir_all(&iso_tb);
-
-    info!(
-        real_home,
-        isolated_home,
-        "session: isolated HOME set up"
-    );
+    info!(real_home, isolated_home, "session: isolated HOME set up");
 }
 
-/// Spawn a private `dbus-daemon --session` and return its bus address.
 fn launch_private_dbus_session() -> Result<String, Box<dyn std::error::Error>> {
     let output = std::process::Command::new("dbus-launch")
         .arg("--sh-syntax")
@@ -292,19 +209,14 @@ fn launch_private_dbus_session() -> Result<String, Box<dyn std::error::Error>> {
             "dbus-launch exited with {:?}: {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+        ).into());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-
     for line in stdout.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("DBUS_SESSION_BUS_ADDRESS=") {
-            let addr = rest
-                .trim_end_matches(';')
-                .trim_matches('\'')
-                .trim_matches('"');
+            let addr = rest.trim_end_matches(';').trim_matches('\'').trim_matches('"');
             if !addr.is_empty() {
                 for pid_line in stdout.lines() {
                     let pid_line = pid_line.trim();
@@ -321,35 +233,25 @@ fn launch_private_dbus_session() -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 
-    Err(format!(
-        "could not parse DBUS_SESSION_BUS_ADDRESS from dbus-launch output: {stdout}"
-    )
-    .into())
+    Err(format!("could not parse DBUS_SESSION_BUS_ADDRESS from dbus-launch output: {stdout}").into())
 }
 
-static DBUS_DAEMON_PID: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static DBUS_DAEMON_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn kill_private_dbus_session() {
     let pid = DBUS_DAEMON_PID.load(std::sync::atomic::Ordering::SeqCst);
     if pid != 0 {
         info!(pid, "session: killing private dbus-daemon");
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
+        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
     }
 }
 
-/// Clean up the isolated home directory on shutdown.
 fn cleanup_isolated_home() {
     if let (Ok(runtime_dir), Ok(real_home)) = (
         std::env::var("XDG_RUNTIME_DIR"),
         std::env::var("MYWM_REAL_HOME"),
     ) {
-        // Restore HOME so nothing writes to the isolated dir during shutdown.
         std::env::set_var("HOME", &real_home);
-
-        // Remove the per-session directory tree.
         let session_dir = format!("{}/mywm-{}", runtime_dir, std::process::id());
         if std::path::Path::new(&session_dir).exists() {
             if let Err(err) = std::fs::remove_dir_all(&session_dir) {
@@ -361,6 +263,10 @@ fn cleanup_isolated_home() {
     }
 }
 
+// -------------------------------------------------------------------------
+// main
+// -------------------------------------------------------------------------
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -369,7 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    info!("bootstrapping bare-metal Wayland compositor (Phase 10)");
+    info!("bootstrapping bare-metal Wayland compositor (Phase 10+29)");
 
     let (lua, config) = Config::load_from_lua();
     info!(
@@ -404,23 +310,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(drm_backend.drm_node);
     info!(?render_node, "resolved render node for dmabuf feedback");
 
-    let dmabuf_formats = renderer
-        .egl_context()
-        .dmabuf_render_formats()
-        .clone();
-
-    let default_feedback = DmabufFeedbackBuilder::new(
-        render_node.dev_id(),
-        dmabuf_formats,
-    )
-    .build()
-    .map_err(|e| format!("failed to build dmabuf feedback: {e:?}"))?;
+    let dmabuf_formats = renderer.egl_context().dmabuf_render_formats().clone();
+    let default_feedback = DmabufFeedbackBuilder::new(render_node.dev_id(), dmabuf_formats)
+        .build()
+        .map_err(|e| format!("failed to build dmabuf feedback: {e:?}"))?;
 
     let mut dmabuf_state = DmabufState::new();
-    let _dmabuf_global = dmabuf_state.create_global_with_default_feedback::<State>(
-        &display_handle,
-        &default_feedback,
-    );
+    let _dmabuf_global = dmabuf_state
+        .create_global_with_default_feedback::<State>(&display_handle, &default_feedback);
     info!("linux_dmabuf global registered with render node feedback");
 
     let compositor_state = CompositorState::new::<State>(&display_handle);
@@ -428,20 +325,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xdg_decoration_state = XdgDecorationState::new::<State>(&display_handle);
     let layer_shell_state = WlrLayerShellState::new::<State>(&display_handle);
     let shm_state = ShmState::new::<State>(&display_handle, vec![]);
-    let output_manager_state =
-        OutputManagerState::new_with_xdg_output::<State>(&display_handle);
+    let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&display_handle);
     let data_device_state = DataDeviceState::new::<State>(&display_handle);
 
     let mut seat_state: SeatState<State> = SeatState::new();
-
-    let mut seat: Seat<State> =
-        seat_state.new_wl_seat(&display_handle, "seat0");
-
+    let mut seat: Seat<State> = seat_state.new_wl_seat(&display_handle, "seat0");
     let keyboard = seat
         .add_keyboard(XkbConfig::default(), 200, 25)
         .map_err(|e| format!("failed to initialise keyboard: {e:?}"))?;
     let pointer = seat.add_pointer();
-
     info!("seat 'seat0' initialised with keyboard + pointer capabilities");
 
     let workspace_count = config.workspace_count().max(1);
@@ -450,17 +342,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     info!(count = workspace_count, "workspaces initialised");
 
-    // ── Create the listening socket ──
     let listening_socket = ListeningSocketSource::new_auto()?;
     let socket_name = listening_socket.socket_name().to_os_string();
     info!(?socket_name, "listening for wayland clients");
 
-    // ══════════════════════════════════════════════════════════════════
-    //  CRITICAL: Lock the environment to THIS compositor BEFORE any
-    //  child process can be spawned (event sources, autostart, etc.).
-    // ══════════════════════════════════════════════════════════════════
     isolate_session_environment(&socket_name);
-
     ensure_waybar_config();
 
     event_loop
@@ -506,8 +392,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_nonblocking(false);
-                        let _ = stream
-                            .set_read_timeout(Some(Duration::from_millis(50)));
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
                         let mut buf = [0u8; 1024];
                         let n = match stream.read(&mut buf) {
                             Ok(n) => n,
@@ -516,9 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         };
-                        if n == 0 {
-                            continue;
-                        }
+                        if n == 0 { continue; }
                         let payload = match std::str::from_utf8(&buf[..n]) {
                             Ok(s) => s.trim(),
                             Err(err) => {
@@ -526,9 +409,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         };
-                        if payload.is_empty() {
-                            continue;
-                        }
+                        if payload.is_empty() { continue; }
                         match serde_json::from_str::<IpcCommand>(payload) {
                             Ok(cmd) => {
                                 info!(?cmd, "IPC command received");
@@ -539,9 +420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        break;
-                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(err) => {
                         warn!(?err, "accept() on IPC socket failed");
                         break;
@@ -557,7 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         LibinputSessionInterface<LibSeatSession>,
     >(session.clone().into());
     match libinput_context.udev_assign_seat(&seat_name) {
-        Ok(()) => info!(seat = %seat_name, "libinput: seat assigned, enumerating devices"),
+        Ok(()) => info!(seat = %seat_name, "libinput: seat assigned"),
         Err(()) => warn!(seat = %seat_name, "libinput: udev_assign_seat failed"),
     }
     let libinput_backend = LibinputInputBackend::new(libinput_context.clone());
@@ -594,28 +473,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.handle().insert_source(udev_backend, |event, _, _data| {
         match event {
             smithay::backend::udev::UdevEvent::Added { device_id, path } => {
-                info!(?device_id, ?path, "udev: GPU added (ignored — single-GPU phase)");
+                info!(?device_id, ?path, "udev: GPU added (ignored)");
             }
             smithay::backend::udev::UdevEvent::Changed { device_id } => {
                 info!(?device_id, "udev: GPU changed");
             }
             smithay::backend::udev::UdevEvent::Removed { device_id } => {
-                warn!(?device_id, "udev: GPU removed — we don't handle this yet");
+                warn!(?device_id, "udev: GPU removed");
             }
         }
     })?;
 
     let drm_token: RegistrationToken = event_loop.handle().insert_source(
         drm_notifier,
-        |event, _meta, data| {
-            handle_drm_event(event, data);
-        },
+        |event, _meta, data| { handle_drm_event(event, data); },
     )?;
 
-    // ── Autostart (runs AFTER env isolation) ──
-      {
-        let autostart_result: Result<mlua::Value, _> =
-            lua.load("return wm.autostart").eval();
+    // ── Autostart ──
+    {
+        let autostart_result: Result<mlua::Value, _> = lua.load("return wm.autostart").eval();
         if let Ok(mlua::Value::Table(cmds)) = autostart_result {
             for cmd in cmds.sequence_values::<String>().flatten() {
                 info!(command = %cmd, "autostart: launching");
@@ -634,10 +510,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-
-    /// Write the default Waybar config and CSS if they don't exist yet.
-    /// Must be called AFTER isolate_session_environment() so HOME points
-    /// to the correct (possibly isolated) directory.
     fn ensure_waybar_config() {
         let home = std::env::var("HOME").unwrap_or_default();
         if home.is_empty() {
@@ -646,32 +518,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let waybar_dir = format!("{}/.config/waybar", home);
-
-        // If waybar dir is a symlink (from setup_isolated_home), remove it
-        // and create a real directory so we control the config
         let waybar_path = std::path::Path::new(&waybar_dir);
-        if waybar_path
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            info!(path = %waybar_dir, "removing waybar config symlink to write our own");
+        if waybar_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            info!(path = %waybar_dir, "removing waybar config symlink");
             let _ = std::fs::remove_file(&waybar_dir);
         }
-
-        // Remove existing waybar dir entirely so we always write fresh
-        // copies from our compiled-in assets.
         if waybar_path.is_dir() {
-            info!(path = %waybar_dir, "removing existing waybar config dir to write fresh assets");
+            info!(path = %waybar_dir, "removing existing waybar config dir");
             let _ = std::fs::remove_dir_all(&waybar_dir);
         }
-
         if let Err(err) = std::fs::create_dir_all(&waybar_dir) {
             warn!(?err, dir = %waybar_dir, "failed to create waybar config dir");
             return;
         }
 
-        // ── All from compiled-in assets ──
         let config_path = format!("{}/config", waybar_dir);
         info!(path = %config_path, "writing waybar config from asset");
         let _ = std::fs::write(&config_path, include_str!("../assets/waybar-config.json"));
@@ -680,51 +540,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(path = %style_path, "writing waybar style.css from asset");
         let _ = std::fs::write(&style_path, include_str!("../assets/waybar-style.css"));
 
-        // Write default colors.css so @import doesn't fail before rc.lua runs.
-        // rc.lua's write_theme_css() will overwrite this immediately on startup,
-        // but we need a valid file for the CSS parser.
         let colors_path = format!("{}/colors.css", waybar_dir);
         info!(path = %colors_path, "writing bootstrap colors.css");
-        let _ = std::fs::write(
-            &colors_path,
-            r#"/* Bootstrap colors — overwritten by rc.lua write_theme_css() */
-    /* Theme: tokyonight */
-    @define-color bg_color #1a1b26;
-    @define-color bg_alt_color #24283b;
-    @define-color bg_surface_color #292e42;
-    @define-color fg_color #c0caf5;
-    @define-color fg_dim_color #565f89;
-    @define-color fg_bright_color #e0e6ff;
-    @define-color accent_color #7aa2f7;
-    @define-color accent2_color #bb9af7;
-    @define-color accent3_color #ff007c;
-    @define-color green_color #73daca;
-    @define-color red_color #f7768e;
-    @define-color orange_color #ff9e64;
-    @define-color yellow_color #e0af68;
-    @define-color cyan_color #7dcfff;
-    @define-color teal_color #2ac3de;
-    @define-color magenta_color #c678dd;
-    @define-color pink_color #ff79c6;
-    @define-color urgent_color #db4b4b;
-    @define-color success_color #9ece6a;
-    @define-color warning_color #e0af68;
-    @define-color active_border #7aa2f7;
-    @define-color inactive_border #1a1b26;
-    @define-color bar_bg_color rgba(26, 27, 38, 0.92);
-    @define-color accent_hover rgba(122, 162, 247, 0.15);
-    @define-color accent_subtle rgba(122, 162, 247, 0.10);
-    @define-color accent_border rgba(122, 162, 247, 0.30);
-    @define-color red_hover rgba(247, 118, 142, 0.20);
-    @define-color red_subtle rgba(247, 118, 142, 0.10);
-    @define-color orange_hover rgba(255, 158, 100, 0.18);
-    @define-color green_subtle rgba(115, 218, 202, 0.10);
-    @define-color separator_color rgba(59, 66, 97, 0.50);
-    @define-color border_glow rgba(122, 162, 247, 0.35);
-    "#,
-        );
+        let _ = std::fs::write(&colors_path, r#"/* Bootstrap colors — overwritten by rc.lua write_theme_css() */
+@define-color bg_color #1a1b26;
+@define-color bg_alt_color #24283b;
+@define-color bg_surface_color #292e42;
+@define-color fg_color #c0caf5;
+@define-color fg_dim_color #565f89;
+@define-color fg_bright_color #e0e6ff;
+@define-color accent_color #7aa2f7;
+@define-color accent2_color #bb9af7;
+@define-color accent3_color #ff007c;
+@define-color green_color #73daca;
+@define-color red_color #f7768e;
+@define-color orange_color #ff9e64;
+@define-color yellow_color #e0af68;
+@define-color cyan_color #7dcfff;
+@define-color teal_color #2ac3de;
+@define-color magenta_color #c678dd;
+@define-color pink_color #ff79c6;
+@define-color urgent_color #db4b4b;
+@define-color success_color #9ece6a;
+@define-color warning_color #e0af68;
+@define-color active_border #7aa2f7;
+@define-color inactive_border #1a1b26;
+@define-color bar_bg_color rgba(26, 27, 38, 0.92);
+@define-color accent_hover rgba(122, 162, 247, 0.15);
+@define-color accent_subtle rgba(122, 162, 247, 0.10);
+@define-color accent_border rgba(122, 162, 247, 0.30);
+@define-color red_hover rgba(247, 118, 142, 0.20);
+@define-color red_subtle rgba(247, 118, 142, 0.10);
+@define-color orange_hover rgba(255, 158, 100, 0.18);
+@define-color green_subtle rgba(115, 218, 202, 0.10);
+@define-color separator_color rgba(59, 66, 97, 0.50);
+@define-color border_glow rgba(122, 162, 247, 0.35);
+"#);
 
-        // Also clean the REAL home's waybar config so it doesn't interfere
         if let Ok(real_home) = std::env::var("MYWM_REAL_HOME") {
             let real_waybar_dir = format!("{}/.config/waybar", real_home);
             let real_waybar_path = std::path::Path::new(&real_waybar_dir);
@@ -734,7 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        info!(waybar_dir = %waybar_dir, "waybar config deployed from compiled-in assets");
+        info!(waybar_dir = %waybar_dir, "waybar config deployed");
     }
 
     let state = State {
@@ -766,12 +618,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         needs_redraw: true,
         renderer,
         pointer_grab: None,
-        // ── Touchpad gesture tracking (Phase 26) ──
         swipe_active: false,
         swipe_fingers: 0,
         swipe_dx: 0.0,
-        // ── Workspace transition animation (Phase 27) ──
         workspace_transition: state::WorkspaceTransition::default(),
+        // ── Phase 29 ──
+        window_opacity: 1.0,
     };
 
     let mut data = CalloopData {
@@ -779,13 +631,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend: drm_backend,
     };
 
-     event_loop.handle().insert_idle(|data| {
+    // Write initial opacity state for Waybar
+    data.state.broadcast_opacity_state();
+
+    event_loop.handle().insert_idle(|data| {
         info!("broadcasting initial workspace state for waybar");
         data.state.broadcast_workspace_state();
     });
 
-    // Re-broadcast workspace state periodically so waybar picks it up
-    // once it finishes connecting (it starts via autostart with a slight delay).
     let broadcast_timer = Timer::from_duration(Duration::from_millis(500));
     event_loop.handle().insert_source(broadcast_timer, |_, _, data| {
         data.state.broadcast_workspace_state();
@@ -812,6 +665,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data.state.needs_redraw = true;
             }
 
+            // ── Reap completed dying window animations ──
+            for ws in data.state.workspaces.iter_mut() {
+                ws.reap_dying_windows();
+            }
+
             if data.state.any_animating() {
                 data.state.recalculate_layout();
                 data.state.needs_redraw = true;
@@ -825,6 +683,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("event loop exited, shutting down");
 
+    // Kill waybar first to stop broken pipe errors from helper scripts
+    let _ = std::process::Command::new("pkill").args(["-x", "waybar"]).status();
+    let _ = std::process::Command::new("pkill").args(["-f", "mywm-workspaces.sh"]).status();
+    let _ = std::process::Command::new("pkill").args(["-f", "mywm-opacity.sh"]).status();
+    // Small delay for processes to exit
+    std::thread::sleep(Duration::from_millis(100));
+
     drop(data.backend);
     event_loop.handle().remove(drm_token);
     drop(data.state);
@@ -834,8 +699,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(ipc_socket_path);
     let _ = std::fs::remove_file(crate::state::workspace_ipc_path());
     let _ = std::fs::remove_file(crate::state::workspace_ipc_stream_path());
+    let _ = std::fs::remove_file(crate::state::opacity_ipc_path());
 
-    // Kill our private dbus-daemon so it doesn't linger.
+        // Kill orphaned Waybar and helper scripts
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "mywm-workspaces.sh"])
+        .status();
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "mywm-opacity.sh"])
+        .status();
+    let _ = std::process::Command::new("pkill")
+        .args(["-x", "waybar"])
+        .status();
+
     kill_private_dbus_session();
     cleanup_isolated_home();
 
@@ -844,7 +720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // -------------------------------------------------------------------------
-// DRM backend
+// DRM backend init (unchanged)
 // -------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -872,21 +748,9 @@ enum BackendError {
 fn init_drm_backend(
     session: &mut LibSeatSession,
     display_handle: &DisplayHandle,
-) -> Result<
-    (
-        DrmBackend,
-        GlesRenderer,
-        Output,
-        smithay::backend::drm::DrmDeviceNotifier,
-    ),
-    BackendError,
-> {
+) -> Result<(DrmBackend, GlesRenderer, Output, smithay::backend::drm::DrmDeviceNotifier), BackendError> {
     let seat_name = session.seat();
-
-    let path = primary_gpu(&seat_name)
-        .ok()
-        .flatten()
-        .ok_or(BackendError::NoPrimaryGpu)?;
+    let path = primary_gpu(&seat_name).ok().flatten().ok_or(BackendError::NoPrimaryGpu)?;
     info!(?path, "DRM: primary GPU path resolved");
 
     let drm_node = DrmNode::from_path(&path)
@@ -894,13 +758,10 @@ fn init_drm_backend(
     info!(?drm_node, node_type = ?drm_node.ty(), "DRM: node opened");
 
     let owned_fd = session
-        .open(
-            &path,
-            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
-        )
+        .open(&path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK)
         .map_err(|e| BackendError::OpenDevice(path.clone(), format!("{e:?}")))?;
     let drm_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
-    info!("DRM: session opened device fd with master access");
+    info!("DRM: session opened device fd");
 
     let (drm, drm_notifier) = DrmDevice::new(drm_fd.clone(), true)?;
     info!(atomic = true, "DRM: DrmDevice initialised");
@@ -909,7 +770,7 @@ fn init_drm_backend(
     info!("GBM: device created");
 
     let egl_display = unsafe { EGLDisplay::new(gbm.clone())? };
-    info!("EGL: display created from GBM");
+    info!("EGL: display created");
 
     let egl_context = EGLContext::new(&egl_display)?;
     info!("EGL: context created");
@@ -924,16 +785,12 @@ fn init_drm_backend(
     for handle in res_handles.connectors() {
         let info = drm.get_connector(*handle, false)?;
         info!(
-            connector = ?info.interface(),
-            id = ?info.handle(),
-            state = ?info.state(),
-            modes = info.modes().len(),
+            connector = ?info.interface(), id = ?info.handle(),
+            state = ?info.state(), modes = info.modes().len(),
             "DRM: probed connector"
         );
         if info.state() == connector::State::Connected && !info.modes().is_empty() {
-            let mode = info
-                .modes()
-                .iter()
+            let mode = info.modes().iter()
                 .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
                 .copied()
                 .unwrap_or_else(|| info.modes()[0]);
@@ -944,9 +801,7 @@ fn init_drm_backend(
     }
     let (connector_info, mode) = picked.ok_or(BackendError::NoConnector)?;
 
-    let crtc = connector_info
-        .encoders()
-        .iter()
+    let crtc = connector_info.encoders().iter()
         .filter_map(|eh| drm.get_encoder(*eh).ok())
         .flat_map(|enc| res_handles.filter_crtcs(enc.possible_crtcs()))
         .next()
@@ -958,7 +813,6 @@ fn init_drm_backend(
     info!("DRM: surface created");
 
     let mode_size = (mode.size().0 as i32, mode.size().1 as i32);
-
     let (phys_w, phys_h) = connector_info.size().unwrap_or((0, 0));
     let output = Output::new(
         format!("{:?}-{}", connector_info.interface(), connector_info.interface_id()),
@@ -976,30 +830,15 @@ fn init_drm_backend(
         size: mode_size.into(),
         refresh: (mode.vrefresh() * 1000) as i32,
     };
-
     output.change_current_state(
-        Some(wl_mode),
-        Some(Transform::Normal),
-        Some(smithay::output::Scale::Integer(1)),
-        Some((0, 0).into()),
+        Some(wl_mode), Some(Transform::Normal),
+        Some(smithay::output::Scale::Integer(1)), Some((0, 0).into()),
     );
     output.set_preferred(wl_mode);
+    info!(size = ?mode_size, refresh = mode.vrefresh(), "DRM: wl_output advertised");
 
-    info!(
-        size = ?mode_size,
-        refresh = mode.vrefresh(),
-        phys_mm = ?(phys_w, phys_h),
-        "DRM: wl_output advertised with mode + scale + transform"
-    );
-
-    let allocator = GbmAllocator::new(
-        gbm.clone(),
-        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-    );
-    let framebuffer_exporter = GbmFramebufferExporter::new(
-        gbm.clone(),
-        smithay::backend::drm::exporter::gbm::NodeFilter::All,
-    );
+    let allocator = GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let framebuffer_exporter = GbmFramebufferExporter::new(gbm.clone(), smithay::backend::drm::exporter::gbm::NodeFilter::All);
     let renderer_formats = renderer.egl_context().dmabuf_render_formats().clone();
     let raw_cursor_size = drm_device.cursor_size();
     let cursor_size = if raw_cursor_size.w > 0 && raw_cursor_size.h > 0 {
@@ -1007,28 +846,18 @@ fn init_drm_backend(
     } else {
         (64u32, 64u32).into()
     };
-    let cursor_size = cursor_size
-        .to_logical(1, Transform::Normal)
-        .to_buffer(1, Transform::Normal);
+    let cursor_size = cursor_size.to_logical(1, Transform::Normal).to_buffer(1, Transform::Normal);
 
     let compositor = DrmCompositor::new(
         smithay::output::OutputModeSource::Auto(output.downgrade()),
-        surface,
-        None,
-        allocator,
-        framebuffer_exporter,
+        surface, None, allocator, framebuffer_exporter,
         [Fourcc::Abgr8888, Fourcc::Argb8888],
-        renderer_formats,
-        cursor_size,
-        Some(gbm),
-    )
-    .map_err(|e| BackendError::Compositor(format!("{e:?}")))?;
-    info!("DRM: compositor ready — first page-flip will kick off the loop");
+        renderer_formats, cursor_size, Some(gbm),
+    ).map_err(|e| BackendError::Compositor(format!("{e:?}")))?;
+    info!("DRM: compositor ready");
 
     let backend = DrmBackend {
-        drm_node,
-        compositor,
-        crtc,
+        drm_node, compositor, crtc,
         frame_sent: HashSet::new(),
         pending_frame: false,
     };
@@ -1036,9 +865,11 @@ fn init_drm_backend(
     Ok((backend, renderer, output, drm_notifier))
 }
 
-use smithay::backend::renderer::element::utils::{
-    RelocateRenderElement, Relocate,
-};
+// -------------------------------------------------------------------------
+// Render elements declaration
+// -------------------------------------------------------------------------
+
+use smithay::backend::renderer::element::utils::{RelocateRenderElement, Relocate};
 
 smithay::backend::renderer::element::render_elements! {
     OutputRenderElements<=GlesRenderer>;
@@ -1047,6 +878,10 @@ smithay::backend::renderer::element::render_elements! {
     Cursor = SolidColorRenderElement,
 }
 
+// -------------------------------------------------------------------------
+// Render frame — Phase 29: alpha, glow, opacity
+// -------------------------------------------------------------------------
+
 fn render_frame(data: &mut CalloopData) {
     let CalloopData { state, backend } = data;
 
@@ -1054,13 +889,14 @@ fn render_frame(data: &mut CalloopData) {
         return;
     }
 
+    let now = Instant::now();
     let border_width = state.config.border_width.max(0);
     let focused_surface = state.keyboard.current_focus();
     let active_color = crate::config::parse_hex_color(&state.config.active_border_color);
     let inactive_color = crate::config::parse_hex_color(&state.config.inactive_border_color);
+    let global_opacity = state.window_opacity;
 
-    let screen_width = state
-        .workspaces[state.active_workspace]
+    let screen_width = state.workspaces[state.active_workspace]
         .space
         .output_geometry(&state.output)
         .map(|g| g.size.w)
@@ -1071,11 +907,7 @@ fn render_frame(data: &mut CalloopData) {
     // ── Cursor on top of everything ──
     let cursor_loc = state.pointer_location.to_i32_round().to_physical(1);
     let cursor_elem = SolidColorRenderElement::from_buffer(
-        &state.cursor_buffer,
-        cursor_loc,
-        1.0,
-        1.0,
-        Kind::Cursor,
+        &state.cursor_buffer, cursor_loc, 1.0, 1.0, Kind::Cursor,
     );
     all_elements.push(OutputRenderElements::Cursor(cursor_elem));
 
@@ -1083,108 +915,116 @@ fn render_frame(data: &mut CalloopData) {
         // ════════════════════════════════════════════════════════
         // ANIMATED: Render both workspaces with X offsets
         // ════════════════════════════════════════════════════════
-
         let transition = state.workspace_transition.clone();
         let from_offset = transition.from_offset(screen_width);
         let to_offset = transition.to_offset(screen_width);
         let from_ws = transition.from_workspace;
         let to_ws = transition.to_workspace;
 
-        // ── Render "from" workspace (sliding out) ──
+        // "from" workspace
         let from_space = &state.workspaces[from_ws].space;
         let from_spaces = [from_space];
         if let Ok(from_elements) = space_render_elements(
-            &mut state.renderer,
-            from_spaces,
-            &state.output,
-            1.0,
+            &mut state.renderer, from_spaces, &state.output, 1.0,
         ) {
-            // Borders for "from" workspace
-            let from_borders = build_border_elements(
-                &state.workspaces[from_ws],
-                border_width,
-                &focused_surface,
-                &active_color,
-                &inactive_color,
-                from_offset,
+            let from_borders = build_border_and_glow_elements(
+                &state.workspaces[from_ws], border_width, &focused_surface,
+                &active_color, &inactive_color, from_offset, now, global_opacity,
             );
-
             for elem in from_elements {
                 all_elements.push(relocate_space_element(elem, from_offset));
             }
             all_elements.extend(from_borders);
         }
 
-        // ── Render "to" workspace (sliding in) ──
+        // Dying windows from "from" workspace
+        all_elements.extend(build_dying_window_elements(
+            &state.workspaces[from_ws], now, from_offset, global_opacity,
+        ));
+
+        // "to" workspace
         let to_space = &state.workspaces[to_ws].space;
         let to_spaces = [to_space];
         if let Ok(to_elements) = space_render_elements(
-            &mut state.renderer,
-            to_spaces,
-            &state.output,
-            1.0,
+            &mut state.renderer, to_spaces, &state.output, 1.0,
         ) {
-            // Borders for "to" workspace
-            let to_borders = build_border_elements(
-                &state.workspaces[to_ws],
-                border_width,
-                &focused_surface,
-                &active_color,
-                &inactive_color,
-                to_offset,
+            let to_borders = build_border_and_glow_elements(
+                &state.workspaces[to_ws], border_width, &focused_surface,
+                &active_color, &inactive_color, to_offset, now, global_opacity,
             );
-
             for elem in to_elements {
                 all_elements.push(relocate_space_element(elem, to_offset));
             }
             all_elements.extend(to_borders);
         }
+
+        // Dying windows from "to" workspace
+        all_elements.extend(build_dying_window_elements(
+            &state.workspaces[to_ws], now, to_offset, global_opacity,
+        ));
     } else {
         // ════════════════════════════════════════════════════════
         // STATIC: Normal single-workspace render
         // ════════════════════════════════════════════════════════
-
-        let active_space = &state.workspaces[state.active_workspace].space;
+        let active_ws_idx = state.active_workspace;
+        let active_space = &state.workspaces[active_ws_idx].space;
         let spaces = [active_space];
-        match space_render_elements(
-            &mut state.renderer,
-            spaces,
-            &state.output,
-            1.0,
-        ) {
+        match space_render_elements(&mut state.renderer, spaces, &state.output, 1.0) {
             Ok(space_elements) => {
-                let border_elements = build_border_elements(
-                    &state.workspaces[state.active_workspace],
-                    border_width,
-                    &focused_surface,
-                    &active_color,
-                    &inactive_color,
-                    0,
+                // Note: space_render_elements produces elements with the alpha
+                // baked into textures. We apply our alpha multiplier via the
+                // border/glow system and the SolidColorRenderElement alpha param.
+                // For true per-window texture alpha, we would need a custom
+                // RenderElement wrapper. Instead we use SolidColorRenderElement
+                // overlays for fade-in/opacity (see below).
+
+                let border_elements = build_border_and_glow_elements(
+                    &state.workspaces[active_ws_idx], border_width,
+                    &focused_surface, &active_color, &inactive_color, 0, now,
+                    global_opacity,
                 );
+
+                // Push borders BEHIND windows (they go into the element list
+                // after space elements, which means lower z-order).
+                all_elements.extend(border_elements);
+
+                // Fade-in overlay: for spawning windows, render a semi-transparent
+                // overlay that fades from the clear color to transparent.
+                let fade_in_overlays = build_fade_in_overlays(
+                    &state.workspaces[active_ws_idx], now, global_opacity,
+                    &state.config.clear_color,
+                );
+                all_elements.extend(fade_in_overlays);
 
                 all_elements.extend(
                     space_elements.into_iter().map(OutputRenderElements::Space),
                 );
-                all_elements.extend(border_elements);
             }
             Err(err) => {
                 warn!(?err, "space_render_elements failed");
                 return;
             }
         }
+
+        // Dying windows (fade-out)
+        all_elements.extend(build_dying_window_elements(
+            &state.workspaces[active_ws_idx], now, 0, global_opacity,
+        ));
     }
 
     let _ = &state.cursor_status;
 
     match backend.compositor.render_frame::<_, _>(
-        &mut state.renderer,
-        &all_elements,
+        &mut state.renderer, &all_elements,
         Color32F::from(state.config.clear_color_f32()),
         FrameFlags::DEFAULT,
     ) {
         Ok(frame) => {
-            if frame.is_empty && !state.workspace_transition.active {
-                trace!("no damage — VBlank loop paused until next redraw");
+            if frame.is_empty
+                && !state.workspace_transition.active
+                && !state.any_animating()
+            {
+                trace!("no damage — VBlank loop paused");
                 state.needs_redraw = false;
             } else if let Err(err) = backend.compositor.queue_frame(()) {
                 warn!(?err, "DRM: queue_frame failed");
@@ -1199,40 +1039,33 @@ fn render_frame(data: &mut CalloopData) {
     }
 
     // ── Send frame callbacks ──
-    let now = state.start_time.elapsed();
+    let elapsed = state.start_time.elapsed();
     let output = state.output.clone();
 
-    // Always send frames to the active workspace
     state.workspaces[state.active_workspace]
         .space
         .elements()
         .for_each(|window| {
-            window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
+            window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
         });
 
-    // During animation, also send frames to the "from" workspace
-    // so its clients don't freeze mid-slide
     if state.workspace_transition.active {
         let from_ws = state.workspace_transition.from_workspace;
         if from_ws != state.active_workspace {
-            state.workspaces[from_ws]
-                .space
-                .elements()
-                .for_each(|window| {
-                    window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
-                        Some(output.clone())
-                    });
+            state.workspaces[from_ws].space.elements().for_each(|window| {
+                window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+                    Some(output.clone())
                 });
+            });
         }
     }
 
-    // Send frame callbacks to layer surfaces (waybar, fuzzel, etc.)
     {
         let map = layer_map_for_output(&output);
         for layer in map.layers() {
-            layer.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
+            layer.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
         }
@@ -1248,15 +1081,29 @@ fn render_frame(data: &mut CalloopData) {
     }
 }
 
-/// Build border SolidColorRenderElements for all windows in a workspace,
-/// with an optional X offset for transition animation.
-fn build_border_elements(
+// -------------------------------------------------------------------------
+// Phase 29: Border + Glow rendering
+// -------------------------------------------------------------------------
+
+/// Glow configuration: number of layers, expansion per layer, alpha per layer.
+const GLOW_LAYERS: &[(i32, f32)] = &[
+    (2, 0.35),
+    (4, 0.18),
+    (6, 0.07),
+];
+
+/// Build border elements for all windows in a workspace.
+/// Active window gets a multi-layered glow effect.
+/// Inactive windows get a flat border.
+fn build_border_and_glow_elements(
     ws: &Workspace,
     border_width: i32,
     focused_surface: &Option<WlSurface>,
     active_color: &[f32; 4],
     inactive_color: &[f32; 4],
     x_offset: i32,
+    now: Instant,
+    global_opacity: f32,
 ) -> Vec<OutputRenderElements> {
     let mut elements = Vec::new();
     let bw = border_width;
@@ -1280,46 +1127,207 @@ fn build_border_elements(
             .map(|t| focused_surface.as_ref() == Some(t.wl_surface()))
             .unwrap_or(false);
 
-        let color = if is_focused { *active_color } else { *inactive_color };
+        // ── Calculate per-window alpha (fade-in + global opacity) ──
+        let spawn_alpha = ws.spawn_times.get(window)
+            .and_then(|t| animation_progress(now, *t))
+            .map(animation_alpha)
+            .unwrap_or(1.0);
+        let window_alpha = spawn_alpha * global_opacity;
 
-        let outer_x = loc.x - bw + x_offset;
-        let outer_y = loc.y - bw;
-        let outer_w = geo.size.w + 2 * bw;
-        let outer_h = geo.size.h + 2 * bw;
+        if is_focused {
+            // ═══════════════════════════════════════════════════
+            // ACTIVE WINDOW: Multi-layered glow effect
+            // ═══════════════════════════════════════════════════
 
-        // Top
-        let buf = SolidColorBuffer::new((outer_w, bw), color);
+            // First render glow layers (outermost first = lowest z-order)
+            for &(expansion, layer_alpha) in GLOW_LAYERS.iter().rev() {
+                let glow_alpha = layer_alpha * window_alpha;
+                // SolidColorBuffer uses premultiplied alpha
+                let color = [
+                    active_color[0] * glow_alpha,
+                    active_color[1] * glow_alpha,
+                    active_color[2] * glow_alpha,
+                    glow_alpha,
+                ];
+
+                let gx = loc.x - bw - expansion + x_offset;
+                let gy = loc.y - bw - expansion;
+                let gw = geo.size.w + 2 * bw + 2 * expansion;
+                let gh = geo.size.h + 2 * bw + 2 * expansion;
+
+                // Top glow strip
+                let buf = SolidColorBuffer::new((gw, expansion + bw), color);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((gx, gy)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+
+                // Bottom glow strip
+                let buf = SolidColorBuffer::new((gw, expansion + bw), color);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf,
+                    Point::<i32, Physical>::from((gx, gy + gh - expansion - bw)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+
+                // Left glow strip
+                let inner_h = gh - 2 * (expansion + bw);
+                if inner_h > 0 {
+                    let buf = SolidColorBuffer::new((expansion + bw, inner_h), color);
+                    let elem = SolidColorRenderElement::from_buffer(
+                        &buf,
+                        Point::<i32, Physical>::from((gx, gy + expansion + bw)),
+                        1.0, 1.0, Kind::Unspecified,
+                    );
+                    elements.push(OutputRenderElements::Cursor(elem));
+                }
+
+                // Right glow strip
+                if inner_h > 0 {
+                    let buf = SolidColorBuffer::new((expansion + bw, inner_h), color);
+                    let elem = SolidColorRenderElement::from_buffer(
+                        &buf,
+                        Point::<i32, Physical>::from((
+                            gx + gw - expansion - bw,
+                            gy + expansion + bw,
+                        )),
+                        1.0, 1.0, Kind::Unspecified,
+                    );
+                    elements.push(OutputRenderElements::Cursor(elem));
+                }
+            }
+
+            // Then the solid border on top of glow
+            let a = active_color[3] * window_alpha;
+            let border_color = [
+                active_color[0] * a,
+                active_color[1] * a,
+                active_color[2] * a,
+                a,
+            ];
+            render_flat_border(
+                &mut elements, loc, geo.size.w, geo.size.h,
+                bw, x_offset, &border_color,
+            );
+        } else {
+            // ═══════════════════════════════════════════════════
+            // INACTIVE WINDOW: Flat border
+            // ═══════════════════════════════════════════════════
+             let a = inactive_color[3] * window_alpha;
+            let border_color = [
+                inactive_color[0] * a,
+                inactive_color[1] * a,
+                inactive_color[2] * a,
+                a,
+            ];
+            render_flat_border(
+                &mut elements, loc, geo.size.w, geo.size.h,
+                bw, x_offset, &border_color,
+            );
+        }
+    }
+
+    elements
+}
+
+/// Render a flat 4-sided border around a window.
+fn render_flat_border(
+    elements: &mut Vec<OutputRenderElements>,
+    loc: Point<i32, Logical>,
+    win_w: i32,
+    win_h: i32,
+    bw: i32,
+    x_offset: i32,
+    color: &[f32; 4],
+) {
+    let outer_x = loc.x - bw + x_offset;
+    let outer_y = loc.y - bw;
+    let outer_w = win_w + 2 * bw;
+    let outer_h = win_h + 2 * bw;
+
+    // Top
+    let buf = SolidColorBuffer::new((outer_w, bw), *color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((outer_x, outer_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+
+    // Bottom
+    let buf = SolidColorBuffer::new((outer_w, bw), *color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((outer_x, outer_y + outer_h - bw)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+
+    // Left
+    let buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), *color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((outer_x, outer_y + bw)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+
+    // Right
+    let buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), *color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf,
+        Point::<i32, Physical>::from((outer_x + outer_w - bw, outer_y + bw)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+}
+
+// -------------------------------------------------------------------------
+// Phase 29: Fade-in overlays
+// -------------------------------------------------------------------------
+
+/// For windows currently in their spawn animation, render a semi-transparent
+/// overlay of the clear color that fades from opaque to transparent.
+/// This creates the illusion of the window fading in.
+fn build_fade_in_overlays(
+    ws: &Workspace,
+    now: Instant,
+    global_opacity: f32,
+    clear_color_hex: &str,
+) -> Vec<OutputRenderElements> {
+    let mut elements = Vec::new();
+    let clear = crate::config::parse_hex_color(clear_color_hex);
+
+    for window in ws.space.elements() {
+        let Some(spawn_time) = ws.spawn_times.get(window) else {
+            continue;
+        };
+        let Some(progress) = animation_progress(now, *spawn_time) else {
+            continue; // Animation complete
+        };
+
+        let alpha = animation_alpha(progress);
+        // Overlay alpha: fully opaque at start (1.0), fully transparent at end (0.0)
+        let overlay_alpha = (1.0 - alpha) * global_opacity;
+        if overlay_alpha < 0.01 {
+            continue;
+        }
+
+        let Some(loc) = ws.space.element_location(window) else {
+            continue;
+        };
+        let geo = window.geometry();
+        if geo.size.w <= 0 || geo.size.h <= 0 {
+            continue;
+        }
+
+                let color = [clear[0], clear[1], clear[2], overlay_alpha];
+        let buf = SolidColorBuffer::new((geo.size.w, geo.size.h), color);
         let elem = SolidColorRenderElement::from_buffer(
             &buf,
-            Point::<i32, Physical>::from((outer_x, outer_y)),
-            1.0, 1.0, Kind::Unspecified,
-        );
-        elements.push(OutputRenderElements::Cursor(elem));
-
-        // Bottom
-        let buf = SolidColorBuffer::new((outer_w, bw), color);
-        let elem = SolidColorRenderElement::from_buffer(
-            &buf,
-            Point::<i32, Physical>::from((outer_x, outer_y + outer_h - bw)),
-            1.0, 1.0, Kind::Unspecified,
-        );
-        elements.push(OutputRenderElements::Cursor(elem));
-
-        // Left
-        let buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), color);
-        let elem = SolidColorRenderElement::from_buffer(
-            &buf,
-            Point::<i32, Physical>::from((outer_x, outer_y + bw)),
-            1.0, 1.0, Kind::Unspecified,
-        );
-        elements.push(OutputRenderElements::Cursor(elem));
-
-        // Right
-        let buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), color);
-        let elem = SolidColorRenderElement::from_buffer(
-            &buf,
-            Point::<i32, Physical>::from((outer_x + outer_w - bw, outer_y + bw)),
-            1.0, 1.0, Kind::Unspecified,
+            Point::<i32, Physical>::from((loc.x, loc.y)),
+            1.0,
+            1.0,
+            Kind::Unspecified,
         );
         elements.push(OutputRenderElements::Cursor(elem));
     }
@@ -1327,9 +1335,100 @@ fn build_border_elements(
     elements
 }
 
-/// Offset a SpaceRenderElements by a horizontal pixel delta.
-/// This works by re-wrapping the element with an adjusted geometry.
-/// Wrap a space element with a horizontal offset for transition animation.
+// -------------------------------------------------------------------------
+// Phase 29: Dying window fade-out elements
+// -------------------------------------------------------------------------
+
+/// Render dying windows as fading-out solid color rectangles.
+/// Since the actual window surface is already destroyed, we render
+/// a colored rectangle at the last known position that fades to transparent.
+fn build_dying_window_elements(
+    ws: &Workspace,
+    now: Instant,
+    x_offset: i32,
+    global_opacity: f32,
+) -> Vec<OutputRenderElements> {
+    let mut elements = Vec::new();
+
+    for dw in &ws.dying_windows {
+        let Some(fade_alpha) = dw.fade_alpha(now) else {
+            continue; // Animation complete, will be reaped
+        };
+
+        let alpha = fade_alpha * global_opacity;
+        if alpha < 0.01 {
+            continue;
+        }
+
+        let w = dw.last_size.0.max(1);
+        let h = dw.last_size.1.max(1);
+        let x = dw.last_location.x + x_offset;
+        let y = dw.last_location.y;
+
+        // Render a semi-transparent overlay that matches the window's last area.
+        // Use a neutral dark color so it looks like the window is fading away.
+        let color = [0.15, 0.12, 0.20, alpha * 0.7];
+        let buf = SolidColorBuffer::new((w, h), color);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((x, y)),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+
+        // Add a brighter border around the dying window for a "dissolve" look
+        let border_alpha = alpha * 0.3;
+        if border_alpha > 0.01 {
+            let border_color = [0.5, 0.5, 0.6, border_alpha];
+            let bw = 2;
+
+            // Top
+            let buf = SolidColorBuffer::new((w + 2 * bw, bw), border_color);
+            let elem = SolidColorRenderElement::from_buffer(
+                &buf,
+                Point::<i32, Physical>::from((x - bw, y - bw)),
+                1.0, 1.0, Kind::Unspecified,
+            );
+            elements.push(OutputRenderElements::Cursor(elem));
+
+            // Bottom
+            let buf = SolidColorBuffer::new((w + 2 * bw, bw), border_color);
+            let elem = SolidColorRenderElement::from_buffer(
+                &buf,
+                Point::<i32, Physical>::from((x - bw, y + h)),
+                1.0, 1.0, Kind::Unspecified,
+            );
+            elements.push(OutputRenderElements::Cursor(elem));
+
+            // Left
+            let buf = SolidColorBuffer::new((bw, h), border_color);
+            let elem = SolidColorRenderElement::from_buffer(
+                &buf,
+                Point::<i32, Physical>::from((x - bw, y)),
+                1.0, 1.0, Kind::Unspecified,
+            );
+            elements.push(OutputRenderElements::Cursor(elem));
+
+            // Right
+            let buf = SolidColorBuffer::new((bw, h), border_color);
+            let elem = SolidColorRenderElement::from_buffer(
+                &buf,
+                Point::<i32, Physical>::from((x + w, y)),
+                1.0, 1.0, Kind::Unspecified,
+            );
+            elements.push(OutputRenderElements::Cursor(elem));
+        }
+    }
+
+    elements
+}
+
+// -------------------------------------------------------------------------
+// Element relocation helper (unchanged)
+// -------------------------------------------------------------------------
+
 fn relocate_space_element(
     elem: SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     x_offset: i32,
@@ -1346,8 +1445,10 @@ fn relocate_space_element(
     }
 }
 
-/// Parse a hex color string like "#7aa2f7" into [f32; 4] RGBA.
-/// Returns opaque white on parse failure.
+// -------------------------------------------------------------------------
+// Hex color parser (unchanged)
+// -------------------------------------------------------------------------
+
 fn parse_hex_color(hex: &str) -> [f32; 4] {
     let hex = hex.trim_start_matches('#');
     if hex.len() < 6 {
@@ -1363,6 +1464,11 @@ fn parse_hex_color(hex: &str) -> [f32; 4] {
     };
     [r, g, b, a]
 }
+
+// -------------------------------------------------------------------------
+// DRM event handler (unchanged)
+// -------------------------------------------------------------------------
+
 fn handle_drm_event(event: DrmEvent, data: &mut CalloopData) {
     match event {
         DrmEvent::VBlank(crtc) => {

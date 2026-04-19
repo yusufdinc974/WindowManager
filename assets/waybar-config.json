@@ -17,6 +17,7 @@
     ],
     "modules-right": [
         "custom/layout",
+        "custom/opacity",
         "pulseaudio",
         "network",
         "battery",
@@ -45,6 +46,18 @@
         "tooltip": false
     },
 
+        "custom/opacity": {
+        "exec": "f=${XDG_RUNTIME_DIR:-/tmp}/mywm-opacity.json; if [ -f \"$f\" ]; then cat \"$f\"; else echo '{\"text\":\"100%\",\"tooltip\":\"Opacity: 100%  Scroll to adjust\",\"percentage\":100}'; fi",
+        "return-type": "json",
+        "interval": 1,
+        "format": "  {}",
+        "tooltip": true,
+        "on-scroll-up": "~/.config/mywm/scripts/mywm-ipc.sh '{\"AdjustOpacity\":{\"value\":0.05}}'",
+        "on-scroll-down": "~/.config/mywm/scripts/mywm-ipc.sh '{\"AdjustOpacity\":{\"value\":-0.05}}'",
+        "on-click": "~/.config/mywm/scripts/mywm-ipc.sh '{\"SetOpacity\":{\"value\":1.0}}'",
+        "on-click-right": "~/.config/mywm/scripts/mywm-ipc.sh '{\"SetOpacity\":{\"value\":0.5}}'"
+    },
+
     "clock": {
         "format": "  {:%H:%M}",
         "format-alt": "  {:%A, %B %d, %Y  %H:%M:%S}",
@@ -71,7 +84,7 @@
     },
 
     "network": {
-        "format-wifi": "  {signalStrength}%",
+        "format-wifi": "󰤨  {signalStrength}%",
         "format-ethernet": "  {ifname}",
         "format-disconnected": "  offline",
         "tooltip-format-wifi": "{essid} ({signalStrength}%)\n{ipaddr}/{cidr}",
@@ -96,6 +109,6 @@
     "custom/power": {
         "format": " ⏻ ",
         "tooltip": false,
-        "on-click": "echo '{\"Quit\"}' | socat - UNIX-CONNECT:/tmp/mywm.sock"
+        "on-click": "~/.config/mywm/scripts/mywm-ipc.sh '\"Quit\"'"
     }
 }

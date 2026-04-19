@@ -55,6 +55,41 @@ pub const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
 pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
 pub const ANIMATION_START_SCALE: f32 = 0.8;
 
+/// Duration for fade-out animation before a window is fully removed.
+pub const FADE_OUT_DURATION: Duration = Duration::from_millis(200);
+
+// -------------------------------------------------------------------------
+// Dying window (fade-out tracking)
+// -------------------------------------------------------------------------
+
+/// A window that has been logically destroyed but is still rendering
+/// its fade-out animation.
+#[derive(Debug, Clone)]
+pub struct DyingWindow {
+    pub window: Window,
+    pub destroy_time: Instant,
+    /// The location the window was at when it started dying.
+    pub last_location: Point<i32, Logical>,
+    /// The geometry size when it started dying.
+    pub last_size: (i32, i32),
+}
+
+impl DyingWindow {
+    /// Returns the fade-out alpha (1.0 → 0.0) using ease-out cubic.
+    /// Returns `None` when the animation is complete and the window
+    /// should be fully removed.
+    pub fn fade_alpha(&self, now: Instant) -> Option<f32> {
+        let elapsed = now.saturating_duration_since(self.destroy_time);
+        if elapsed >= FADE_OUT_DURATION {
+            return None;
+        }
+        let t = elapsed.as_secs_f32() / FADE_OUT_DURATION.as_secs_f32();
+        // Ease-out cubic: starts fast, ends slow
+        let eased = 1.0 - (1.0 - (1.0 - t)).powi(3);
+        // eased goes 0→1 as t goes 0→1, so alpha = 1 - eased
+        Some((1.0 - eased).clamp(0.0, 1.0))
+    }
+}
 
 // -------------------------------------------------------------------------
 // Workspace transition animation
@@ -62,8 +97,8 @@ pub const ANIMATION_START_SCALE: f32 = 0.8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionDirection {
-    Left,  // Moving to a higher-index workspace (content slides left)
-    Right, // Moving to a lower-index workspace (content slides right)
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +127,6 @@ impl Default for WorkspaceTransition {
 }
 
 impl WorkspaceTransition {
-    /// Start a new transition animation.
     pub fn begin(&mut self, from: usize, to: usize) {
         self.active = true;
         self.from_workspace = from;
@@ -106,29 +140,22 @@ impl WorkspaceTransition {
         self.progress = 0.0;
     }
 
-    /// Advance the animation. Returns true if still animating.
     pub fn tick(&mut self) -> bool {
         if !self.active {
             return false;
         }
-
         let elapsed = self.start_time.elapsed();
         let linear = (elapsed.as_secs_f64() / self.duration.as_secs_f64()).min(1.0);
-
-        // Ease-out cubic: 1 - (1 - t)^3
         let t = 1.0 - linear;
         self.progress = 1.0 - (t * t * t);
-
         if self.progress >= 1.0 {
             self.progress = 1.0;
             self.active = false;
             return false;
         }
-
         true
     }
 
-    /// Get the X offset for the "from" workspace (sliding out).
     pub fn from_offset(&self, screen_width: i32) -> i32 {
         let w = screen_width as f64;
         match self.direction {
@@ -137,7 +164,6 @@ impl WorkspaceTransition {
         }
     }
 
-    /// Get the X offset for the "to" workspace (sliding in).
     pub fn to_offset(&self, screen_width: i32) -> i32 {
         let w = screen_width as f64;
         match self.direction {
@@ -148,7 +174,7 @@ impl WorkspaceTransition {
 }
 
 // -------------------------------------------------------------------------
-// Pointer grab state for interactive move / resize
+// Pointer grab state
 // -------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +213,8 @@ pub struct Workspace {
     pub floating_geo: HashMap<Window, Rectangle<i32, Logical>>,
     pub split_ratio: f32,
     pub stack_ratios: Vec<f32>,
+    /// Windows currently playing their fade-out animation.
+    pub dying_windows: Vec<DyingWindow>,
 }
 
 impl Workspace {
@@ -203,6 +231,7 @@ impl Workspace {
             floating_geo: HashMap::new(),
             split_ratio: 0.5,
             stack_ratios: Vec::new(),
+            dying_windows: Vec::new(),
         }
     }
 
@@ -217,12 +246,10 @@ impl Workspace {
     pub fn ensure_stack_ratios(&mut self) {
         let tiled = self.tiled_windows();
         let stack_count = if tiled.len() > 1 { tiled.len() - 1 } else { 0 };
-
         if stack_count == 0 {
             self.stack_ratios.clear();
             return;
         }
-
         if self.stack_ratios.len() != stack_count {
             let equal = 1.0 / stack_count as f32;
             self.stack_ratios = vec![equal; stack_count];
@@ -246,7 +273,22 @@ impl Workspace {
             }
         }
     }
+
+    /// Garbage-collect dying windows whose fade-out has completed.
+    pub fn reap_dying_windows(&mut self) {
+        let now = Instant::now();
+        self.dying_windows.retain(|dw| dw.fade_alpha(now).is_some());
+    }
+
+    /// Returns true if any dying windows are still animating.
+    pub fn has_dying_windows(&self) -> bool {
+        !self.dying_windows.is_empty()
+    }
 }
+
+// -------------------------------------------------------------------------
+// Animation helpers
+// -------------------------------------------------------------------------
 
 pub fn animation_progress(now: Instant, spawn_time: Instant) -> Option<f32> {
     let elapsed = now.saturating_duration_since(spawn_time);
@@ -262,7 +304,6 @@ pub fn animation_scale(progress: f32) -> f32 {
     ANIMATION_START_SCALE + (1.0 - ANIMATION_START_SCALE) * progress
 }
 
-#[allow(dead_code)]
 pub fn animation_alpha(progress: f32) -> f32 {
     progress.clamp(0.0, 1.0)
 }
@@ -316,7 +357,7 @@ pub struct State {
     pub renderer: GlesRenderer,
 
     pub pointer_grab: Option<GrabState>,
-    
+
     // ── Touchpad gesture tracking ──
     pub swipe_active: bool,
     pub swipe_fingers: u32,
@@ -324,6 +365,9 @@ pub struct State {
 
     // ── Workspace transition animation (Phase 27) ──
     pub workspace_transition: WorkspaceTransition,
+
+    // ── Phase 29: Global window opacity (controlled via IPC / Waybar) ──
+    pub window_opacity: f32,
 }
 
 #[derive(Default)]
@@ -374,12 +418,10 @@ pub struct CalloopData {
 // -------------------------------------------------------------------------
 
 impl State {
-     /// Hot-reload config from disk (TOML + Lua).
     pub fn reload_config(&mut self) {
         info!("reloading configuration from disk");
         self.config.reload(&self.lua);
 
-        // Re-tile everything with new gaps/borders
         let output = self.output.clone();
         let outer = self.config.outer_gaps;
         let inner = self.config.inner_gaps;
@@ -391,7 +433,7 @@ impl State {
         self.needs_redraw = true;
     }
 
-     pub fn toggle_wallpaper_menu(&mut self) {
+    pub fn toggle_wallpaper_menu(&mut self) {
         let call = self.lua.load(
             "if type(toggle_wallpaper_menu) == 'function' then toggle_wallpaper_menu() \
              else print('rc.lua: toggle_wallpaper_menu is not defined') end",
@@ -403,7 +445,6 @@ impl State {
         self.needs_redraw = true;
     }
 
-    /// Returns true if a layer surface currently holds keyboard focus.
     pub fn layer_has_keyboard_focus(&self) -> bool {
         let Some(focused) = self.keyboard.current_focus() else {
             return false;
@@ -478,15 +519,31 @@ impl State {
             return;
         };
         let window = ws.windows.remove(idx);
-        ws.spawn_times.remove(&window);
+        let _spawn_time = ws.spawn_times.remove(&window);
         ws.configured_sizes.remove(&window);
         ws.floating.remove(&window);
         ws.floating_geo.remove(&window);
+
+        // ── Phase 29: Start fade-out animation instead of instant removal ──
+        let last_location = ws
+            .space
+            .element_location(&window)
+            .unwrap_or_else(|| Point::from((0, 0)));
+        let last_size = window_current_size(&window)
+            .map(|s| (s.w, s.h))
+            .unwrap_or((100, 100));
+
+        ws.dying_windows.push(DyingWindow {
+            window: window.clone(),
+            destroy_time: Instant::now(),
+            last_location,
+            last_size,
+        });
+
         if let Some(toplevel) = window.toplevel() {
             toplevel.send_close();
         }
         ws.space.unmap_elem(&window);
-
         ws.stack_ratios.clear();
 
         let next_focus = self.workspaces[self.active_workspace]
@@ -533,6 +590,7 @@ impl State {
             ws.spawn_times
                 .values()
                 .any(|t| animation_progress(now, *t).is_some())
+                || ws.has_dying_windows()
         })
     }
 
@@ -663,13 +721,44 @@ impl State {
         }
         self.needs_redraw = true;
     }
+
+    // ── Phase 29: Opacity control ──
+
+    pub fn set_window_opacity(&mut self, opacity: f32) {
+        self.window_opacity = opacity.clamp(0.1, 1.0);
+        info!(opacity = self.window_opacity, "window opacity set");
+        self.needs_redraw = true;
+    }
+
+    pub fn adjust_window_opacity(&mut self, delta: f32) {
+        let new = (self.window_opacity + delta).clamp(0.1, 1.0);
+        self.window_opacity = new;
+        info!(opacity = self.window_opacity, "window opacity adjusted");
+        self.needs_redraw = true;
+
+        // Write current opacity to a file for Waybar to read
+        self.broadcast_opacity_state();
+    }
+
+    /// Write current opacity to a file Waybar can poll.
+    pub fn broadcast_opacity_state(&self) {
+        let path = opacity_ipc_path();
+        let pct = (self.window_opacity * 100.0).round() as i32;
+        let json = format!(
+            r#"{{"text": "{}%", "tooltip": "Window Opacity: {}%", "class": "opacity", "percentage": {}}}"#,
+            pct, pct, pct
+        );
+        let tmp = format!("{}.tmp", path);
+        if let Ok(()) = std::fs::write(&tmp, &json) {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
-// Workspace IPC — broadcasts workspace state to listeners (Waybar, etc.)
+// Workspace IPC
 // -------------------------------------------------------------------------
 
-/// JSON representation of workspace state, consumed by Waybar's custom module.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkspaceIpcState {
     pub workspaces: Vec<WorkspaceInfo>,
@@ -686,7 +775,6 @@ pub struct WorkspaceInfo {
 }
 
 impl State {
-    /// Build the current workspace state snapshot.
     pub fn workspace_ipc_state(&self) -> WorkspaceIpcState {
         let mut workspaces = Vec::with_capacity(self.workspaces.len());
         for (i, ws) in self.workspaces.iter().enumerate() {
@@ -708,8 +796,6 @@ impl State {
         WorkspaceIpcState { workspaces }
     }
 
-    /// Write current workspace state to the IPC socket file so Waybar
-    /// (and other tools) can read it.
     pub fn broadcast_workspace_state(&self) {
         let state = self.workspace_ipc_state();
         let json = match serde_json::to_string(&state) {
@@ -721,8 +807,6 @@ impl State {
         };
 
         let ipc_path = workspace_ipc_path();
-
-        // Write atomically: write to .tmp then rename
         let tmp_path = format!("{}.tmp", ipc_path);
         match std::fs::write(&tmp_path, &json) {
             Ok(()) => {
@@ -735,22 +819,17 @@ impl State {
             }
         }
 
-        // Also notify any connected stream listeners
         self.notify_workspace_listeners(&json);
     }
 
-    /// Notify connected Waybar listener sockets.
     fn notify_workspace_listeners(&self, json: &str) {
         let sock_path = workspace_ipc_stream_path();
-        // Best-effort: connect and write, don't block if nobody is listening
         if let Ok(mut stream) = UnixStream::connect(&sock_path) {
             let _ = stream.set_nonblocking(true);
             let _ = stream.write_all(json.as_bytes());
             let _ = stream.write_all(b"\n");
         }
     }
-
-    // Update existing methods to broadcast on workspace change:
 
     pub fn switch_workspace(&mut self, idx: usize) {
         if idx >= self.workspaces.len() {
@@ -770,11 +849,7 @@ impl State {
         );
 
         let from = self.active_workspace;
-
-        // Start the cinematic transition
         self.workspace_transition.begin(from, idx);
-
-        // Switch the active workspace immediately so input goes to the right place
         self.active_workspace = idx;
 
         let focus = self.workspaces[self.active_workspace]
@@ -788,8 +863,6 @@ impl State {
 
         self.recalculate_layout();
         self.needs_redraw = true;
-
-        // ── Broadcast workspace change ──
         self.broadcast_workspace_state();
     }
 
@@ -888,8 +961,6 @@ impl State {
         );
 
         self.needs_redraw = true;
-
-        // ── Broadcast workspace change ──
         self.broadcast_workspace_state();
     }
 }
@@ -911,5 +982,13 @@ pub fn workspace_ipc_stream_path() -> String {
         format!("{}/mywm-workspaces.sock", runtime)
     } else {
         "/tmp/mywm-workspaces.sock".to_string()
+    }
+}
+
+pub fn opacity_ipc_path() -> String {
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        format!("{}/mywm-opacity.json", runtime)
+    } else {
+        "/tmp/mywm-opacity.json".to_string()
     }
 }
