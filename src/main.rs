@@ -770,6 +770,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         swipe_active: false,
         swipe_fingers: 0,
         swipe_dx: 0.0,
+        // ── Workspace transition animation (Phase 27) ──
+        workspace_transition: state::WorkspaceTransition::default(),
     };
 
     let mut data = CalloopData {
@@ -803,6 +805,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ws = &mut data.state.workspaces[data.state.active_workspace];
             ws.space.refresh();
             data.state.popups.cleanup();
+
+            // ── Tick workspace transition animation ──
+            if data.state.workspace_transition.active {
+                data.state.workspace_transition.tick();
+                data.state.needs_redraw = true;
+            }
 
             if data.state.any_animating() {
                 data.state.recalculate_layout();
@@ -1028,9 +1036,14 @@ fn init_drm_backend(
     Ok((backend, renderer, output, drm_notifier))
 }
 
+use smithay::backend::renderer::element::utils::{
+    RelocateRenderElement, Relocate,
+};
+
 smithay::backend::renderer::element::render_elements! {
     OutputRenderElements<=GlesRenderer>;
     Space = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Relocated = RelocateRenderElement<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>,
     Cursor = SolidColorRenderElement,
 }
 
@@ -1041,110 +1054,21 @@ fn render_frame(data: &mut CalloopData) {
         return;
     }
 
-    let active_space = &state.workspaces[state.active_workspace].space;
-    let spaces = [active_space];
-    let space_elements = match space_render_elements(
-        &mut state.renderer,
-        spaces,
-        &state.output,
-        1.0,
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            warn!(?err, "space_render_elements failed");
-            return;
-        }
-    };
-
-    // ── Build border elements for every mapped window ──
     let border_width = state.config.border_width.max(0);
     let focused_surface = state.keyboard.current_focus();
-
     let active_color = crate::config::parse_hex_color(&state.config.active_border_color);
     let inactive_color = crate::config::parse_hex_color(&state.config.inactive_border_color);
 
-    let mut border_elements: Vec<OutputRenderElements> = Vec::new();
+    let screen_width = state
+        .workspaces[state.active_workspace]
+        .space
+        .output_geometry(&state.output)
+        .map(|g| g.size.w)
+        .unwrap_or(1920);
 
-    let ws = &state.workspaces[state.active_workspace];
-    for window in ws.space.elements() {
-        if border_width <= 0 {
-            break;
-        }
+    let mut all_elements: Vec<OutputRenderElements> = Vec::new();
 
-        let Some(loc) = ws.space.element_location(window) else {
-            continue;
-        };
-
-        let geo = window.geometry();
-        if geo.size.w <= 0 || geo.size.h <= 0 {
-            continue;
-        }
-
-        let is_focused = window
-            .toplevel()
-            .map(|t| focused_surface.as_ref() == Some(t.wl_surface()))
-            .unwrap_or(false);
-
-        let color = if is_focused { active_color } else { inactive_color };
-
-        let bw = border_width;
-
-        let outer_x = loc.x - bw;
-        let outer_y = loc.y - bw;
-        let outer_w = geo.size.w + 2 * bw;
-        let outer_h = geo.size.h + 2 * bw;
-
-        // Top edge
-        let top_buf = SolidColorBuffer::new((outer_w, bw), color);
-        let top_elem = SolidColorRenderElement::from_buffer(
-            &top_buf,
-            Point::<i32, Physical>::from((outer_x, outer_y)),
-            1.0,
-            1.0,
-            Kind::Unspecified,
-        );
-        border_elements.push(OutputRenderElements::Cursor(top_elem));
-
-        // Bottom edge
-        let bot_buf = SolidColorBuffer::new((outer_w, bw), color);
-        let bot_elem = SolidColorRenderElement::from_buffer(
-            &bot_buf,
-            Point::<i32, Physical>::from((outer_x, outer_y + outer_h - bw)),
-            1.0,
-            1.0,
-            Kind::Unspecified,
-        );
-        border_elements.push(OutputRenderElements::Cursor(bot_elem));
-
-        // Left edge
-        let left_buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), color);
-        let left_elem = SolidColorRenderElement::from_buffer(
-            &left_buf,
-            Point::<i32, Physical>::from((outer_x, outer_y + bw)),
-            1.0,
-            1.0,
-            Kind::Unspecified,
-        );
-        border_elements.push(OutputRenderElements::Cursor(left_elem));
-
-        // Right edge
-        let right_buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), color);
-        let right_elem = SolidColorRenderElement::from_buffer(
-            &right_buf,
-            Point::<i32, Physical>::from((outer_x + outer_w - bw, outer_y + bw)),
-            1.0,
-            1.0,
-            Kind::Unspecified,
-        );
-        border_elements.push(OutputRenderElements::Cursor(right_elem));
-    }
-
-    // ── Assemble final element list ──
-    // Order: cursor (top) → windows → borders (behind windows)
-    let mut wrapped: Vec<OutputRenderElements> =
-        Vec::with_capacity(space_elements.len() + border_elements.len() + 1);
-
-    // Cursor on top of everything.
+    // ── Cursor on top of everything ──
     let cursor_loc = state.pointer_location.to_i32_round().to_physical(1);
     let cursor_elem = SolidColorRenderElement::from_buffer(
         &state.cursor_buffer,
@@ -1153,24 +1077,113 @@ fn render_frame(data: &mut CalloopData) {
         1.0,
         Kind::Cursor,
     );
-    wrapped.push(OutputRenderElements::Cursor(cursor_elem));
+    all_elements.push(OutputRenderElements::Cursor(cursor_elem));
 
-    // Window surfaces.
-    wrapped.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+    if state.workspace_transition.active {
+        // ════════════════════════════════════════════════════════
+        // ANIMATED: Render both workspaces with X offsets
+        // ════════════════════════════════════════════════════════
 
-    // Borders behind the windows.
-    wrapped.extend(border_elements);
+        let transition = state.workspace_transition.clone();
+        let from_offset = transition.from_offset(screen_width);
+        let to_offset = transition.to_offset(screen_width);
+        let from_ws = transition.from_workspace;
+        let to_ws = transition.to_workspace;
+
+        // ── Render "from" workspace (sliding out) ──
+        let from_space = &state.workspaces[from_ws].space;
+        let from_spaces = [from_space];
+        if let Ok(from_elements) = space_render_elements(
+            &mut state.renderer,
+            from_spaces,
+            &state.output,
+            1.0,
+        ) {
+            // Borders for "from" workspace
+            let from_borders = build_border_elements(
+                &state.workspaces[from_ws],
+                border_width,
+                &focused_surface,
+                &active_color,
+                &inactive_color,
+                from_offset,
+            );
+
+            for elem in from_elements {
+                all_elements.push(relocate_space_element(elem, from_offset));
+            }
+            all_elements.extend(from_borders);
+        }
+
+        // ── Render "to" workspace (sliding in) ──
+        let to_space = &state.workspaces[to_ws].space;
+        let to_spaces = [to_space];
+        if let Ok(to_elements) = space_render_elements(
+            &mut state.renderer,
+            to_spaces,
+            &state.output,
+            1.0,
+        ) {
+            // Borders for "to" workspace
+            let to_borders = build_border_elements(
+                &state.workspaces[to_ws],
+                border_width,
+                &focused_surface,
+                &active_color,
+                &inactive_color,
+                to_offset,
+            );
+
+            for elem in to_elements {
+                all_elements.push(relocate_space_element(elem, to_offset));
+            }
+            all_elements.extend(to_borders);
+        }
+    } else {
+        // ════════════════════════════════════════════════════════
+        // STATIC: Normal single-workspace render
+        // ════════════════════════════════════════════════════════
+
+        let active_space = &state.workspaces[state.active_workspace].space;
+        let spaces = [active_space];
+        match space_render_elements(
+            &mut state.renderer,
+            spaces,
+            &state.output,
+            1.0,
+        ) {
+            Ok(space_elements) => {
+                let border_elements = build_border_elements(
+                    &state.workspaces[state.active_workspace],
+                    border_width,
+                    &focused_surface,
+                    &active_color,
+                    &inactive_color,
+                    0,
+                );
+
+                all_elements.extend(
+                    space_elements.into_iter().map(OutputRenderElements::Space),
+                );
+                all_elements.extend(border_elements);
+            }
+            Err(err) => {
+                warn!(?err, "space_render_elements failed");
+                return;
+            }
+        }
+    }
 
     let _ = &state.cursor_status;
 
     match backend.compositor.render_frame::<_, _>(
         &mut state.renderer,
-        &wrapped,
+        &all_elements,
         Color32F::from(state.config.clear_color_f32()),
         FrameFlags::DEFAULT,
     ) {
         Ok(frame) => {
-            if frame.is_empty {
+            if frame.is_empty && !state.workspace_transition.active {
                 trace!("no damage — VBlank loop paused until next redraw");
                 state.needs_redraw = false;
             } else if let Err(err) = backend.compositor.queue_frame(()) {
@@ -1185,19 +1198,37 @@ fn render_frame(data: &mut CalloopData) {
         }
     }
 
+    // ── Send frame callbacks ──
     let now = state.start_time.elapsed();
     let output = state.output.clone();
 
-    // Send frame callbacks to tiled/floating windows.
-    for ws in state.workspaces.iter() {
-        ws.space.elements().for_each(|window| {
+    // Always send frames to the active workspace
+    state.workspaces[state.active_workspace]
+        .space
+        .elements()
+        .for_each(|window| {
             window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
         });
+
+    // During animation, also send frames to the "from" workspace
+    // so its clients don't freeze mid-slide
+    if state.workspace_transition.active {
+        let from_ws = state.workspace_transition.from_workspace;
+        if from_ws != state.active_workspace {
+            state.workspaces[from_ws]
+                .space
+                .elements()
+                .for_each(|window| {
+                    window.send_frame(&output, now, Some(Duration::ZERO), |_, _| {
+                        Some(output.clone())
+                    });
+                });
+        }
     }
 
-    // Send frame callbacks to layer surfaces (waybar, fuzzel, etc.).
+    // Send frame callbacks to layer surfaces (waybar, fuzzel, etc.)
     {
         let map = layer_map_for_output(&output);
         for layer in map.layers() {
@@ -1214,6 +1245,104 @@ fn render_frame(data: &mut CalloopData) {
         if err.kind() != std::io::ErrorKind::BrokenPipe {
             warn!(?err, "failed to flush wayland clients");
         }
+    }
+}
+
+/// Build border SolidColorRenderElements for all windows in a workspace,
+/// with an optional X offset for transition animation.
+fn build_border_elements(
+    ws: &Workspace,
+    border_width: i32,
+    focused_surface: &Option<WlSurface>,
+    active_color: &[f32; 4],
+    inactive_color: &[f32; 4],
+    x_offset: i32,
+) -> Vec<OutputRenderElements> {
+    let mut elements = Vec::new();
+    let bw = border_width;
+
+    if bw <= 0 {
+        return elements;
+    }
+
+    for window in ws.space.elements() {
+        let Some(loc) = ws.space.element_location(window) else {
+            continue;
+        };
+
+        let geo = window.geometry();
+        if geo.size.w <= 0 || geo.size.h <= 0 {
+            continue;
+        }
+
+        let is_focused = window
+            .toplevel()
+            .map(|t| focused_surface.as_ref() == Some(t.wl_surface()))
+            .unwrap_or(false);
+
+        let color = if is_focused { *active_color } else { *inactive_color };
+
+        let outer_x = loc.x - bw + x_offset;
+        let outer_y = loc.y - bw;
+        let outer_w = geo.size.w + 2 * bw;
+        let outer_h = geo.size.h + 2 * bw;
+
+        // Top
+        let buf = SolidColorBuffer::new((outer_w, bw), color);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((outer_x, outer_y)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+
+        // Bottom
+        let buf = SolidColorBuffer::new((outer_w, bw), color);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((outer_x, outer_y + outer_h - bw)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+
+        // Left
+        let buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), color);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((outer_x, outer_y + bw)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+
+        // Right
+        let buf = SolidColorBuffer::new((bw, outer_h - 2 * bw), color);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((outer_x + outer_w - bw, outer_y + bw)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+    }
+
+    elements
+}
+
+/// Offset a SpaceRenderElements by a horizontal pixel delta.
+/// This works by re-wrapping the element with an adjusted geometry.
+/// Wrap a space element with a horizontal offset for transition animation.
+fn relocate_space_element(
+    elem: SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    x_offset: i32,
+) -> OutputRenderElements {
+    if x_offset == 0 {
+        OutputRenderElements::Space(elem)
+    } else {
+        let relocated = RelocateRenderElement::from_element(
+            elem,
+            Point::<i32, Physical>::from((x_offset, 0)),
+            Relocate::Relative,
+        );
+        OutputRenderElements::Relocated(relocated)
     }
 }
 

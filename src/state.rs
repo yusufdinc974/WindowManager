@@ -55,6 +55,98 @@ pub const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
 pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
 pub const ANIMATION_START_SCALE: f32 = 0.8;
 
+
+// -------------------------------------------------------------------------
+// Workspace transition animation
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionDirection {
+    Left,  // Moving to a higher-index workspace (content slides left)
+    Right, // Moving to a lower-index workspace (content slides right)
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceTransition {
+    pub active: bool,
+    pub from_workspace: usize,
+    pub to_workspace: usize,
+    pub direction: TransitionDirection,
+    pub start_time: Instant,
+    pub duration: Duration,
+    pub progress: f64,
+}
+
+impl Default for WorkspaceTransition {
+    fn default() -> Self {
+        Self {
+            active: false,
+            from_workspace: 0,
+            to_workspace: 0,
+            direction: TransitionDirection::Left,
+            start_time: Instant::now(),
+            duration: Duration::from_millis(250),
+            progress: 0.0,
+        }
+    }
+}
+
+impl WorkspaceTransition {
+    /// Start a new transition animation.
+    pub fn begin(&mut self, from: usize, to: usize) {
+        self.active = true;
+        self.from_workspace = from;
+        self.to_workspace = to;
+        self.direction = if to > from {
+            TransitionDirection::Left
+        } else {
+            TransitionDirection::Right
+        };
+        self.start_time = Instant::now();
+        self.progress = 0.0;
+    }
+
+    /// Advance the animation. Returns true if still animating.
+    pub fn tick(&mut self) -> bool {
+        if !self.active {
+            return false;
+        }
+
+        let elapsed = self.start_time.elapsed();
+        let linear = (elapsed.as_secs_f64() / self.duration.as_secs_f64()).min(1.0);
+
+        // Ease-out cubic: 1 - (1 - t)^3
+        let t = 1.0 - linear;
+        self.progress = 1.0 - (t * t * t);
+
+        if self.progress >= 1.0 {
+            self.progress = 1.0;
+            self.active = false;
+            return false;
+        }
+
+        true
+    }
+
+    /// Get the X offset for the "from" workspace (sliding out).
+    pub fn from_offset(&self, screen_width: i32) -> i32 {
+        let w = screen_width as f64;
+        match self.direction {
+            TransitionDirection::Left => -(self.progress * w) as i32,
+            TransitionDirection::Right => (self.progress * w) as i32,
+        }
+    }
+
+    /// Get the X offset for the "to" workspace (sliding in).
+    pub fn to_offset(&self, screen_width: i32) -> i32 {
+        let w = screen_width as f64;
+        match self.direction {
+            TransitionDirection::Left => (w - self.progress * w) as i32,
+            TransitionDirection::Right => -(w - self.progress * w) as i32,
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // Pointer grab state for interactive move / resize
 // -------------------------------------------------------------------------
@@ -229,6 +321,9 @@ pub struct State {
     pub swipe_active: bool,
     pub swipe_fingers: u32,
     pub swipe_dx: f64,
+
+    // ── Workspace transition animation (Phase 27) ──
+    pub workspace_transition: WorkspaceTransition,
 }
 
 #[derive(Default)]
@@ -659,9 +754,15 @@ impl State {
             from = self.active_workspace + 1,
             to = idx + 1,
             layout = %self.workspaces[idx].layout,
-            "switching workspace"
+            "switching workspace (animated)"
         );
 
+        let from = self.active_workspace;
+
+        // Start the cinematic transition
+        self.workspace_transition.begin(from, idx);
+
+        // Switch the active workspace immediately so input goes to the right place
         self.active_workspace = idx;
 
         let focus = self.workspaces[self.active_workspace]
