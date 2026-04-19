@@ -766,6 +766,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         needs_redraw: true,
         renderer,
         pointer_grab: None,
+        // ── Touchpad gesture tracking (Phase 26) ──
+        swipe_active: false,
+        swipe_fingers: 0,
+        swipe_dx: 0.0,
     };
 
     let mut data = CalloopData {

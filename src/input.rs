@@ -8,7 +8,8 @@ use serde::Deserialize;
 use smithay::{
     backend::{
         input::{
-            ButtonState, Event as _, InputEvent, KeyState, KeyboardKeyEvent,
+            ButtonState, Event as _, GestureBeginEvent, GestureEndEvent,
+            GestureSwipeUpdateEvent, InputEvent, KeyState, KeyboardKeyEvent,
             PointerButtonEvent, PointerMotionEvent,
         },
         libinput::LibinputInputBackend,
@@ -23,12 +24,16 @@ use smithay::{
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
     wayland::shell::wlr_layer::Layer as WlrLayer,
 };
+
 use tracing::{debug, info, trace, warn};
 
 use crate::state::{window_current_size, GrabMode, GrabState, State};
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+
+/// Minimum accumulated horizontal pixels to trigger a workspace switch.
+const SWIPE_THRESHOLD: f64 = 100.0;
 
 // -------------------------------------------------------------------------
 // Action / IPC command types
@@ -799,6 +804,74 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
         }
         InputEvent::DeviceRemoved { device } => {
             info!(name = %device.name(), "libinput: device removed");
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // Touchpad 3-finger swipe → workspace switching
+        // ─────────────────────────────────────────────────────────
+
+        InputEvent::GestureSwipeBegin { event } => {
+            let fingers = event.fingers();
+            debug!(fingers, "gesture swipe begin");
+            if fingers == 3 {
+                state.swipe_active = true;
+                state.swipe_fingers = fingers;
+                state.swipe_dx = 0.0;
+            }
+        }
+
+        InputEvent::GestureSwipeUpdate { event } => {
+            if state.swipe_active {
+                let dx = event.delta_x();
+                state.swipe_dx += dx;
+                trace!(
+                    dx,
+                    accumulated = state.swipe_dx,
+                    "gesture swipe update"
+                );
+            }
+        }
+
+        InputEvent::GestureSwipeEnd { event } => {
+            if state.swipe_active {
+                let cancelled = event.cancelled();
+                debug!(
+                    swipe_dx = state.swipe_dx,
+                    cancelled,
+                    "gesture swipe end"
+                );
+
+                if !cancelled {
+                    let threshold = state.config.swipe_threshold;
+                    if state.swipe_dx > threshold {
+                        // Swiped right → next workspace
+                        info!(
+                            swipe_dx = state.swipe_dx,
+                            "3-finger swipe right → workspace next"
+                        );
+                        let current = state.active_workspace;
+                        let max = state.workspaces.len().saturating_sub(1);
+                        if current < max {
+                            state.switch_workspace(current + 1);
+                        }
+                    } else if state.swipe_dx < -threshold {
+                        // Swiped left → previous workspace
+                        info!(
+                            swipe_dx = state.swipe_dx,
+                            "3-finger swipe left → workspace prev"
+                        );
+                        let current = state.active_workspace;
+                        if current > 0 {
+                            state.switch_workspace(current - 1);
+                        }
+                    }
+                }
+
+                // Always reset state
+                state.swipe_active = false;
+                state.swipe_fingers = 0;
+                state.swipe_dx = 0.0;
+            }
         }
 
         _ => {}

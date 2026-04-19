@@ -224,6 +224,11 @@ pub struct State {
     pub renderer: GlesRenderer,
 
     pub pointer_grab: Option<GrabState>,
+    
+    // ── Touchpad gesture tracking ──
+    pub swipe_active: bool,
+    pub swipe_fingers: u32,
+    pub swipe_dx: f64,
 }
 
 #[derive(Default)]

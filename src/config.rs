@@ -72,6 +72,13 @@ pub struct Config {
     pub workspace_names: Vec<String>,
     #[serde(default = "default_keybinds")]
     pub keybinds: Vec<Keybind>,
+    #[serde(default = "default_swipe_threshold")]
+    pub swipe_threshold: f64,
+
+}
+
+fn default_swipe_threshold() -> f64 {
+    100.0
 }
 
 /// Minimal hardcoded fallback — used ONLY by serde's #[serde(default)]
@@ -94,6 +101,7 @@ impl Default for Config {
                 "7".into(), "8".into(), "9".into(),
             ],
             keybinds: default_keybinds(),
+            swipe_threshold: default_swipe_threshold(),
         }
     }
 }
@@ -379,6 +387,7 @@ fn seed_wm_table(lua: &Lua, config: &Config) -> mlua::Result<()> {
     wm.set("active_border_color", config.active_border_color.clone())?;
     wm.set("inactive_border_color", config.inactive_border_color.clone())?;
     wm.set("clear_color", config.clear_color.clone())?;
+    wm.set("swipe_threshold", config.swipe_threshold)?;
 
     let names = lua.create_table()?;
     for (i, n) in config.workspace_names.iter().enumerate() {
@@ -411,6 +420,7 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
     let clear_color: String = get_or(
         &wm, "clear_color", defaults.clear_color.clone(),
     );
+    let swipe_threshold: f64 = get_or(&wm, "swipe_threshold", defaults.swipe_threshold);
 
     let workspace_names = match wm.get::<_, Value>("workspace_names") {
         Ok(Value::Table(t)) => {
@@ -439,6 +449,7 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
         clear_color,
         workspace_names,
         keybinds: defaults.keybinds,
+        swipe_threshold,
     })
 }
 
