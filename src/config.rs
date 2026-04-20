@@ -1,7 +1,7 @@
 //! Dual-format runtime configuration: TOML (simple) + Lua (advanced).
 //!
 //! Load order:
-//!   1. Deploy compiled-in assets to ~/.config/mywm/
+//!   1. Deploy compiled-in assets to ~/.config/lumie/
 //!   2. Parse the deployed config.toml
 //!   3. Run the deployed rc.lua on top (can override TOML values)
 //!
@@ -199,9 +199,9 @@ impl Config {
         let script_dir = dir.join("scripts");
         let _ = fs::create_dir_all(&script_dir);
 
-        // mywm-workspaces.sh
-        let script_dest = script_dir.join("mywm-workspaces.sh");
-        match fs::write(&script_dest, include_str!("../assets/mywm-workspaces.sh")) {
+        // lumie-workspaces.sh
+        let script_dest = script_dir.join("lumie-workspaces.sh");
+        match fs::write(&script_dest, include_str!("../assets/lumie-workspaces.sh")) {
             Ok(()) => {
                 #[cfg(unix)]
                 {
@@ -211,7 +211,7 @@ impl Config {
                         fs::Permissions::from_mode(0o755),
                     );
                 }
-                info!(?script_dest, "config: deployed mywm-workspaces.sh from asset");
+                info!(?script_dest, "config: deployed lumie-workspaces.sh from asset");
             }
             Err(err) => warn!(?err, ?script_dest, "config: failed to write workspace script"),
         }
@@ -250,9 +250,9 @@ impl Config {
             Err(err) => warn!(?err, ?restore_dest, "config: failed to write wallpaper restore script"),
         }
 
-        // mywm-ipc.sh
-        let ipc_dest = script_dir.join("mywm-ipc.sh");
-        match fs::write(&ipc_dest, include_str!("../assets/mywm-ipc.sh")) {
+        // lumie-ipc.sh
+        let ipc_dest = script_dir.join("lumie-ipc.sh");
+        match fs::write(&ipc_dest, include_str!("../assets/lumie-ipc.sh")) {
             Ok(()) => {
                 #[cfg(unix)]
                 {
@@ -262,14 +262,14 @@ impl Config {
                         fs::Permissions::from_mode(0o755),
                     );
                 }
-                info!(?ipc_dest, "config: deployed mywm-ipc.sh from asset");
+                info!(?ipc_dest, "config: deployed lumie-ipc.sh from asset");
             }
             Err(err) => warn!(?err, ?ipc_dest, "config: failed to write IPC script"),
         }
 
-        // mywm-opacity.sh
-        let opacity_dest = script_dir.join("mywm-opacity.sh");
-        match fs::write(&opacity_dest, include_str!("../assets/mywm-opacity.sh")) {
+        // lumie-opacity.sh
+        let opacity_dest = script_dir.join("lumie-opacity.sh");
+        match fs::write(&opacity_dest, include_str!("../assets/lumie-opacity.sh")) {
             Ok(()) => {
                 #[cfg(unix)]
                 {
@@ -279,7 +279,7 @@ impl Config {
                         fs::Permissions::from_mode(0o755),
                     );
                 }
-                info!(?opacity_dest, "config: deployed mywm-opacity.sh from asset");
+                info!(?opacity_dest, "config: deployed lumie-opacity.sh from asset");
             }
             Err(err) => warn!(?err, ?opacity_dest, "config: failed to write opacity script"),
         }
@@ -559,11 +559,11 @@ fn config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         let p = PathBuf::from(xdg);
         if !p.as_os_str().is_empty() {
-            return Some(p.join("mywm"));
+            return Some(p.join("lumie"));
         }
     }
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config").join("mywm"))
+    Some(PathBuf::from(home).join(".config").join("lumie"))
 }
 
 fn rc_path() -> Option<PathBuf> {

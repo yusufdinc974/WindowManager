@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sort wallpapers by dominant color into mywm theme directories.
+Sort wallpapers by dominant color into lumie theme directories.
 
 Themes and their dominant hues:
   tokyonight  → Blue    (#7aa2f7)
@@ -44,7 +44,7 @@ THEMES = {
     "catppuccin": (310,        30,            0.10),   # Pink
 }
 
-DEST_BASE = Path.home() / ".config" / "mywm" / "wallpapers"
+DEST_BASE = Path.home() / ".config" / "lumie" / "wallpapers"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 

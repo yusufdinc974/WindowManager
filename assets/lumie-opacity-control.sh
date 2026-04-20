@@ -1,10 +1,10 @@
 #!/bin/bash
-# mywm-opacity-control.sh — Visual opacity slider for Waybar
-SOCK="/tmp/mywm.sock"
+# lumie-opacity-control.sh — Visual opacity slider for Waybar
+SOCK="/tmp/lumie.sock"
 
 # Read current opacity
 CURRENT=100
-OPACITY_FILE="${XDG_RUNTIME_DIR:-/tmp}/mywm-opacity.json"
+OPACITY_FILE="${XDG_RUNTIME_DIR:-/tmp}/lumie-opacity.json"
 if [ -f "$OPACITY_FILE" ] && command -v python3 >/dev/null 2>&1; then
     CURRENT=$(python3 -c "
 import json

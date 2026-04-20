@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  mywm — Automatic Wallpaper Color Classifier
+#  lumie — Automatic Wallpaper Color Classifier
 #  Usage: wallpaper-sort.sh <source_directory>
 #
 #  Analyzes dominant colors of images and copies them
@@ -13,12 +13,12 @@
 set -euo pipefail
 
 SOURCE_DIR="${1:-}"
-WALLPAPER_BASE="$HOME/.config/mywm/wallpapers"
+WALLPAPER_BASE="$HOME/.config/lumie/wallpapers"
 
 if [[ -z "$SOURCE_DIR" || ! -d "$SOURCE_DIR" ]]; then
     echo "Usage: wallpaper-sort.sh <source_directory>"
     echo "  Scans all images in <source_directory> and copies them"
-    echo "  to ~/.config/mywm/wallpapers/<best_matching_theme>/"
+    echo "  to ~/.config/lumie/wallpapers/<best_matching_theme>/"
     exit 1
 fi
 
@@ -209,7 +209,7 @@ score_theme() {
 
 # ── Main: classify each image ──
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  mywm Wallpaper Classifier                              ║"
+echo "║  lumie Wallpaper Classifier                              ║"
 echo "║  Scanning: $SOURCE_DIR"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""

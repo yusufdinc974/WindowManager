@@ -62,7 +62,10 @@ use smithay::{
         compositor::CompositorState,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         output::OutputManagerState,
-        selection::data_device::DataDeviceState,
+        selection::{
+            data_device::DataDeviceState,
+            primary_selection::PrimarySelectionState,
+        },
         shell::{
             wlr_layer::WlrLayerShellState,
             xdg::{decoration::XdgDecorationState, XdgShellState},
@@ -93,8 +96,8 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
     std::env::set_var("WAYLAND_DISPLAY", socket_name);
     std::env::remove_var("WAYLAND_DEBUG");
     std::env::set_var("XDG_SESSION_TYPE", "wayland");
-    std::env::set_var("XDG_CURRENT_DESKTOP", "mywm");
-    std::env::set_var("XDG_SESSION_DESKTOP", "mywm");
+    std::env::set_var("XDG_CURRENT_DESKTOP", "lumie");
+    std::env::set_var("XDG_SESSION_DESKTOP", "lumie");
     std::env::remove_var("DISPLAY");
     std::env::set_var("MOZ_ENABLE_WAYLAND", "1");
     std::env::set_var("GDK_BACKEND", "wayland");
@@ -107,7 +110,7 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
     std::env::set_var("NO_AT_BRIDGE", "1");
     std::env::set_var("GTK_A11Y", "none");
 
-    let session_id = format!("mywm-{}", std::process::id());
+    let session_id = format!("lumie-{}", std::process::id());
 
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         let moz_dir = format!("{}/{}/mozilla", runtime_dir, session_id);
@@ -123,7 +126,7 @@ fn isolate_session_environment(socket_name: &std::ffi::OsStr) {
         let _ = std::fs::create_dir_all(&isolated_home);
         setup_isolated_home(&real_home, &isolated_home, &moz_dir, &tb_dir);
         std::env::set_var("HOME", &isolated_home);
-        std::env::set_var("MYWM_REAL_HOME", &real_home);
+        std::env::set_var("lumie_REAL_HOME", &real_home);
 
         info!(
             isolated_home = %isolated_home,
@@ -250,10 +253,10 @@ fn kill_private_dbus_session() {
 fn cleanup_isolated_home() {
     if let (Ok(runtime_dir), Ok(real_home)) = (
         std::env::var("XDG_RUNTIME_DIR"),
-        std::env::var("MYWM_REAL_HOME"),
+        std::env::var("lumie_REAL_HOME"),
     ) {
         std::env::set_var("HOME", &real_home);
-        let session_dir = format!("{}/mywm-{}", runtime_dir, std::process::id());
+        let session_dir = format!("{}/lumie-{}", runtime_dir, std::process::id());
         if std::path::Path::new(&session_dir).exists() {
             if let Err(err) = std::fs::remove_dir_all(&session_dir) {
                 warn!(?err, dir = %session_dir, "failed to clean up session directory");
@@ -357,6 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shm_state = ShmState::new::<State>(&display_handle, vec![]);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&display_handle);
     let data_device_state = DataDeviceState::new::<State>(&display_handle);
+    let primary_selection_state = PrimarySelectionState::new::<State>(&display_handle);
 
     let mut seat_state: SeatState<State> = SeatState::new();
     let mut seat: Seat<State> = seat_state.new_wl_seat(&display_handle, "seat0");
@@ -408,7 +412,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let ipc_socket_path = "/tmp/mywm.sock";
+    let ipc_socket_path = "/tmp/lumie.sock";
     let _ = std::fs::remove_file(ipc_socket_path);
     let ipc_listener = UnixListener::bind(ipc_socket_path)?;
     ipc_listener.set_nonblocking(true)?;
@@ -554,6 +558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seat_state,
         dmabuf_state,
         data_device_state,
+        primary_selection_state,
         seat,
         keyboard,
         pointer,
@@ -635,8 +640,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Kill waybar first to stop broken pipe errors from helper scripts
     let _ = std::process::Command::new("pkill").args(["-x", "waybar"]).status();
-    let _ = std::process::Command::new("pkill").args(["-f", "mywm-workspaces.sh"]).status();
-    let _ = std::process::Command::new("pkill").args(["-f", "mywm-opacity.sh"]).status();
+    let _ = std::process::Command::new("pkill").args(["-f", "lumie-workspaces.sh"]).status();
+    let _ = std::process::Command::new("pkill").args(["-f", "lumie-opacity.sh"]).status();
     // Small delay for processes to exit
     std::thread::sleep(Duration::from_millis(100));
 
@@ -653,10 +658,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Kill orphaned Waybar and helper scripts
     let _ = std::process::Command::new("pkill")
-        .args(["-f", "mywm-workspaces.sh"])
+        .args(["-f", "lumie-workspaces.sh"])
         .status();
     let _ = std::process::Command::new("pkill")
-        .args(["-f", "mywm-opacity.sh"])
+        .args(["-f", "lumie-opacity.sh"])
         .status();
     let _ = std::process::Command::new("pkill")
         .args(["-x", "waybar"])
@@ -670,7 +675,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // -------------------------------------------------------------------------
-// ensure_waybar_config — deploys Waybar + mywm scripts to isolated HOME
+// ensure_waybar_config — deploys Waybar + lumie scripts to isolated HOME
 // -------------------------------------------------------------------------
 
 fn ensure_waybar_config() {
@@ -741,30 +746,30 @@ fn ensure_waybar_config() {
 @define-color border_glow rgba(122, 162, 247, 0.35);
 "#);
 
-    // ── Deploy mywm scripts ──
-    let scripts_dir = format!("{}/.config/mywm/scripts", home);
+    // ── Deploy lumie scripts ──
+    let scripts_dir = format!("{}/.config/lumie/scripts", home);
     if let Err(err) = std::fs::create_dir_all(&scripts_dir) {
-        warn!(?err, dir = %scripts_dir, "failed to create mywm scripts dir");
+        warn!(?err, dir = %scripts_dir, "failed to create lumie scripts dir");
         return;
     }
 
-    let opacity_sh = format!("{}/mywm-opacity.sh", scripts_dir);
-    info!(path = %opacity_sh, "writing mywm-opacity.sh");
-    let _ = std::fs::write(&opacity_sh, include_str!("../assets/mywm-opacity.sh"));
+    let opacity_sh = format!("{}/lumie-opacity.sh", scripts_dir);
+    info!(path = %opacity_sh, "writing lumie-opacity.sh");
+    let _ = std::fs::write(&opacity_sh, include_str!("../assets/lumie-opacity.sh"));
     set_executable(&opacity_sh);
 
-    let opacity_control_sh = format!("{}/mywm-opacity-control.sh", scripts_dir);
-    info!(path = %opacity_control_sh, "writing mywm-opacity-control.sh");
-    let _ = std::fs::write(&opacity_control_sh, include_str!("../assets/mywm-opacity-control.sh"));
+    let opacity_control_sh = format!("{}/lumie-opacity-control.sh", scripts_dir);
+    info!(path = %opacity_control_sh, "writing lumie-opacity-control.sh");
+    let _ = std::fs::write(&opacity_control_sh, include_str!("../assets/lumie-opacity-control.sh"));
     set_executable(&opacity_control_sh);
 
-    let workspaces_sh = format!("{}/mywm-workspaces.sh", scripts_dir);
-    info!(path = %workspaces_sh, "writing mywm-workspaces.sh");
-    let _ = std::fs::write(&workspaces_sh, include_str!("../assets/mywm-workspaces.sh"));
+    let workspaces_sh = format!("{}/lumie-workspaces.sh", scripts_dir);
+    info!(path = %workspaces_sh, "writing lumie-workspaces.sh");
+    let _ = std::fs::write(&workspaces_sh, include_str!("../assets/lumie-workspaces.sh"));
     set_executable(&workspaces_sh);
 
     // ── Clean stale waybar config from real HOME ──
-    if let Ok(real_home) = std::env::var("MYWM_REAL_HOME") {
+    if let Ok(real_home) = std::env::var("lumie_REAL_HOME") {
         let real_waybar_dir = format!("{}/.config/waybar", real_home);
         let real_waybar_path = std::path::Path::new(&real_waybar_dir);
         if real_waybar_path.is_dir() {
@@ -876,8 +881,8 @@ fn init_drm_backend(
         PhysicalProperties {
             size: (phys_w as i32, phys_h as i32).into(),
             subpixel: Subpixel::Unknown,
-            make: "Unknown".into(),
-            model: "WindowManager".into(),
+            make: "Lumie Project".into(),
+            model: "lumie".into(),
             serial_number: "00000000".into(),
         },
     );

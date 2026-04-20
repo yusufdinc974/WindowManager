@@ -808,8 +808,16 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             pointer.frame(state);
         }
 
-        InputEvent::DeviceAdded { device } => {
+        InputEvent::DeviceAdded { mut device } => {
             info!(name = %device.name(), "libinput: device added");
+            if device.config_tap_finger_count() > 0 {
+                let _ = device.config_tap_set_enabled(true);
+                info!(
+                    name = %device.name(),
+                    fingers = device.config_tap_finger_count(),
+                    "tap-to-click enabled"
+                );
+            }
         }
         InputEvent::DeviceRemoved { device } => {
             info!(name = %device.name(), "libinput: device removed");

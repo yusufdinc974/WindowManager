@@ -1,5 +1,5 @@
 [package]
-name = "wm"
+name = "lumie"
 version = "0.1.0"
 edition = "2021"
 description = "Phase 3: xdg-shell compositor hosting real Wayland clients."

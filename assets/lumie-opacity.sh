@@ -1,8 +1,8 @@
 #!/bin/bash
-# mywm-opacity.sh — Long-running Waybar module for opacity display
+# lumie-opacity.sh — Long-running Waybar module for opacity display
 trap 'exit 0' PIPE TERM INT
 
-OPACITY_FILE="${XDG_RUNTIME_DIR:-/tmp}/mywm-opacity.json"
+OPACITY_FILE="${XDG_RUNTIME_DIR:-/tmp}/lumie-opacity.json"
 DEFAULT='{"text":"100%","tooltip":"Window Opacity: 100%\nClick: slider | Scroll: adjust | Right-click: reset","class":"opacity","percentage":100}'
 
 # MUST output something immediately or Waybar hides the module

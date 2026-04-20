@@ -38,7 +38,10 @@ use smithay::{
         compositor::{get_parent, CompositorClientState, CompositorState},
         dmabuf::DmabufState,
         output::OutputManagerState,
-        selection::data_device::DataDeviceState,
+        selection::{
+            data_device::DataDeviceState,
+            primary_selection::PrimarySelectionState,
+        },
         shell::{
             wlr_layer::WlrLayerShellState,
             xdg::{decoration::XdgDecorationState, XdgShellState},
@@ -336,6 +339,7 @@ pub struct State {
     pub seat_state: SeatState<Self>,
     pub dmabuf_state: DmabufState,
     pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState, 
 
     pub seat: Seat<Self>,
     pub keyboard: KeyboardHandle<Self>,
@@ -986,24 +990,24 @@ impl State {
 
 pub fn workspace_ipc_path() -> String {
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        format!("{}/mywm-workspaces.json", runtime)
+        format!("{}/lumie-workspaces.json", runtime)
     } else {
-        "/tmp/mywm-workspaces.json".to_string()
+        "/tmp/lumie-workspaces.json".to_string()
     }
 }
 
 pub fn workspace_ipc_stream_path() -> String {
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        format!("{}/mywm-workspaces.sock", runtime)
+        format!("{}/lumie-workspaces.sock", runtime)
     } else {
-        "/tmp/mywm-workspaces.sock".to_string()
+        "/tmp/lumie-workspaces.sock".to_string()
     }
 }
 
 pub fn opacity_ipc_path() -> String {
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        format!("{}/mywm-opacity.json", runtime)
+        format!("{}/lumie-opacity.json", runtime)
     } else {
-        "/tmp/mywm-opacity.json".to_string()
+        "/tmp/lumie-opacity.json".to_string()
     }
 }

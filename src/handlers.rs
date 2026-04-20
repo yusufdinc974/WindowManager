@@ -1,6 +1,3 @@
-//! Smithay protocol handler implementations for `State`.
-use smithay::reexports::wayland_server::Resource;
-
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
@@ -10,7 +7,8 @@ use smithay::{
         },
     },
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
-    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
+    delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{layer_map_for_output, LayerSurface, Window, WindowSurfaceType},
     input::{pointer::CursorImageStatus, Seat, SeatHandler, SeatState},
     output::Output,
@@ -21,9 +19,10 @@ use smithay::{
         },
         wayland_server::{
             protocol::{
-                wl_buffer::WlBuffer, wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface,
+                wl_buffer::WlBuffer, wl_output::WlOutput, wl_seat::WlSeat,
+                wl_surface::WlSurface,
             },
-            Client,
+            Client, Resource,
         },
     },
     utils::{Point, Serial, SERIAL_COUNTER},
@@ -37,7 +36,11 @@ use smithay::{
         output::OutputHandler,
         selection::{
             data_device::{
-                DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
+                set_data_device_focus, DataDeviceHandler, DataDeviceState,
+                WaylandDndGrabHandler,
+            },
+            primary_selection::{
+                set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
             },
             SelectionHandler,
         },
@@ -48,8 +51,8 @@ use smithay::{
             },
             xdg::{
                 decoration::XdgDecorationHandler,
-                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-                XdgToplevelSurfaceData,
+                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler,
+                XdgShellState, XdgToplevelSurfaceData,
             },
         },
         shm::{ShmHandler, ShmState},
@@ -74,7 +77,15 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // ── Route clipboard + primary-selection focus to the newly
+        //    focused client so copy/paste (including middle-click) works ──
+        let dh = &self.display_handle;
+        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        set_data_device_focus(dh, seat, client.clone());
+        set_primary_focus(dh, seat, client);
+    }
+
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
         self.needs_redraw = true;
@@ -228,6 +239,14 @@ impl DataDeviceHandler for State {
 impl WaylandDndGrabHandler for State {}
 
 delegate_data_device!(State);
+
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.primary_selection_state
+    }
+}
+
+delegate_primary_selection!(State);
 
 // -------------------------------------------------------------------------
 // XdgShellHandler

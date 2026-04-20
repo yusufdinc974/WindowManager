@@ -1,9 +1,9 @@
 #!/bin/bash
-# mywm-ipc.sh — Send a JSON command to the compositor's IPC socket.
-# Usage: mywm-ipc.sh '{"AdjustOpacity":{"value":0.05}}'
+# lumie-ipc.sh — Send a JSON command to the compositor's IPC socket.
+# Usage: lumie-ipc.sh '{"AdjustOpacity":{"value":0.05}}'
 
-SOCK="/tmp/mywm.sock"
-MSG="${1:?usage: mywm-ipc.sh '<json>'}"
+SOCK="/tmp/lumie.sock"
+MSG="${1:?usage: lumie-ipc.sh '<json>'}"
 
 if [ ! -S "$SOCK" ]; then
     exit 1

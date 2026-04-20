@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  mywm — Theme-Aware Wallpaper Picker
+#  lumie — Theme-Aware Wallpaper Picker
 #  Usage: wallpaper-picker.sh <theme_name>
 # ============================================================
 
@@ -9,7 +9,7 @@ set -euo pipefail
 # ── Resolve real HOME (handles sandboxed sessions) ──
 resolve_real_home() {
     local h="$HOME"
-    if [[ "$h" =~ /run/user/[0-9]+/mywm-[^/]+/home ]]; then
+    if [[ "$h" =~ /run/user/[0-9]+/lumie-[^/]+/home ]]; then
         local real_home
         real_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
         if [[ -n "$real_home" ]]; then
@@ -23,8 +23,8 @@ resolve_real_home() {
 REAL_HOME="$(resolve_real_home)"
 
 THEME_NAME="${1:-}"
-WALLPAPER_DIR="${REAL_HOME}/.config/mywm/wallpapers/${THEME_NAME}"
-CACHE_DIR="${REAL_HOME}/.cache/mywm"
+WALLPAPER_DIR="${REAL_HOME}/.config/lumie/wallpapers/${THEME_NAME}"
+CACHE_DIR="${REAL_HOME}/.cache/lumie"
 CACHE_FILE="${CACHE_DIR}/current_wallpaper.txt"
 THEME_CACHE_FILE="${CACHE_DIR}/wallpaper_${THEME_NAME}.txt"
 
