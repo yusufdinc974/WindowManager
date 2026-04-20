@@ -115,6 +115,167 @@ pub struct WorkspaceTransition {
     pub progress: f64,
 }
 
+// -------------------------------------------------------------------------
+// 1-to-1 Gesture swipe state (Phase 33)
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct GestureSwipeState {
+    /// True while fingers are on the touchpad.
+    pub tracking: bool,
+    /// Number of fingers in the gesture.
+    pub fingers: u32,
+    /// Accumulated horizontal pixel offset (positive = swiping right = prev ws).
+    pub cumulative_dx: f64,
+    /// Workspace index when the gesture started.
+    pub origin_workspace: usize,
+    /// Cached screen width in pixels.
+    pub screen_width: f64,
+
+    // ── Snap/spring-back animation ──
+    pub animating: bool,
+    pub anim_start_offset: f64,
+    pub anim_target_offset: f64,
+    pub anim_start_time: Instant,
+    pub anim_duration: Duration,
+}
+
+impl Default for GestureSwipeState {
+    fn default() -> Self {
+        Self {
+            tracking: false,
+            fingers: 0,
+            cumulative_dx: 0.0,
+            origin_workspace: 0,
+            screen_width: 1920.0,
+            animating: false,
+            anim_start_offset: 0.0,
+            anim_target_offset: 0.0,
+            anim_start_time: Instant::now(),
+            anim_duration: Duration::from_millis(300),
+        }
+    }
+}
+
+/// Threshold: fraction of screen width required to commit a workspace switch.
+const GESTURE_COMMIT_THRESHOLD: f64 = 0.30;
+/// Velocity threshold (px/ms): fast flicks commit even below distance threshold.
+const GESTURE_VELOCITY_THRESHOLD: f64 = 0.8;
+
+impl GestureSwipeState {
+    /// Returns the current pixel offset — either live tracking or mid-animation.
+    pub fn current_offset(&self) -> f64 {
+        if self.tracking {
+            return self.cumulative_dx;
+        }
+        if !self.animating {
+            return 0.0;
+        }
+        let elapsed = self.anim_start_time.elapsed().as_secs_f64();
+        let total = self.anim_duration.as_secs_f64();
+        let t = (elapsed / total).min(1.0);
+        // Ease-out cubic: fast start, gentle landing
+        let eased = 1.0 - (1.0 - t).powi(3);
+        self.anim_start_offset + (self.anim_target_offset - self.anim_start_offset) * eased
+    }
+
+    /// Tick the snap animation.  Returns `true` while still animating.
+    pub fn tick(&mut self) -> bool {
+        if !self.animating {
+            return false;
+        }
+        let elapsed = self.anim_start_time.elapsed();
+        if elapsed >= self.anim_duration {
+            self.animating = false;
+            self.cumulative_dx = self.anim_target_offset;
+            return false;
+        }
+        true
+    }
+
+    /// Decide whether to snap forward or spring back, then start the animation.
+    /// `duration_ms` is the total gesture duration for velocity calculation.
+    pub fn finish(&mut self, duration_ms: f64) -> GestureOutcome {
+        self.tracking = false;
+        let fraction = self.cumulative_dx.abs() / self.screen_width;
+        let velocity = if duration_ms > 0.0 {
+            self.cumulative_dx.abs() / duration_ms
+        } else {
+            0.0
+        };
+
+        let commit = fraction >= GESTURE_COMMIT_THRESHOLD
+            || velocity >= GESTURE_VELOCITY_THRESHOLD;
+
+        let outcome = if commit && self.cumulative_dx > 0.0 && self.origin_workspace > 0 {
+            // Swiped right → go to previous workspace
+            GestureOutcome::SwitchTo(self.origin_workspace - 1)
+        } else if commit
+            && self.cumulative_dx < 0.0
+        {
+            // Swiped left → go to next workspace (caller must bounds-check)
+            GestureOutcome::SwitchTo(self.origin_workspace + 1)
+        } else {
+            GestureOutcome::SnapBack
+        };
+
+        // Start animation
+        self.animating = true;
+        self.anim_start_offset = self.cumulative_dx;
+        self.anim_start_time = Instant::now();
+
+        match outcome {
+            GestureOutcome::SwitchTo(_) => {
+                // Animate to full screen width in the swipe direction
+                self.anim_target_offset = if self.cumulative_dx > 0.0 {
+                    self.screen_width
+                } else {
+                    -self.screen_width
+                };
+                self.anim_duration = Duration::from_millis(250);
+            }
+            GestureOutcome::SnapBack => {
+                self.anim_target_offset = 0.0;
+                // Shorter spring-back for snappy feel
+                self.anim_duration = Duration::from_millis(200);
+            }
+        }
+
+        outcome
+    }
+
+    /// Reset all state (called after animation completes and workspace index updated).
+    pub fn reset(&mut self) {
+        self.tracking = false;
+        self.animating = false;
+        self.cumulative_dx = 0.0;
+    }
+
+    /// True if the gesture system needs rendering (tracking or animating).
+    pub fn needs_render(&self) -> bool {
+        self.tracking || self.animating
+    }
+
+    /// Returns which adjacent workspace to render, if any.
+    /// `max_ws` is the maximum workspace index (len - 1).
+    pub fn adjacent_workspace(&self, max_ws: usize) -> Option<usize> {
+        let offset = self.current_offset();
+        if offset > 0.0 && self.origin_workspace > 0 {
+            Some(self.origin_workspace - 1)
+        } else if offset < 0.0 && self.origin_workspace < max_ws {
+            Some(self.origin_workspace + 1)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureOutcome {
+    SwitchTo(usize),
+    SnapBack,
+}
+
 impl Default for WorkspaceTransition {
     fn default() -> Self {
         Self {
@@ -362,10 +523,11 @@ pub struct State {
 
     pub pointer_grab: Option<GrabState>,
 
-    // ── Touchpad gesture tracking ──
-    pub swipe_active: bool,
-    pub swipe_fingers: u32,
-    pub swipe_dx: f64,
+    pub gesture_swipe: GestureSwipeState,
+    /// Timestamp when the current gesture began (for velocity calc).
+    pub gesture_start_time: Instant,
+    /// Pending workspace switch after gesture animation completes.
+    pub gesture_pending_switch: Option<usize>,
 
     // ── Workspace transition animation (Phase 27) ──
     pub workspace_transition: WorkspaceTransition,

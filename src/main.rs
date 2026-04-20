@@ -574,9 +574,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         needs_redraw: true,
         renderer,
         pointer_grab: None,
-        swipe_active: false,
-        swipe_fingers: 0,
-        swipe_dx: 0.0,
+        gesture_swipe: state::GestureSwipeState::default(),
+        gesture_start_time: Instant::now(),
+        gesture_pending_switch: None,
         workspace_transition: state::WorkspaceTransition::default(),
         window_opacity: 1.0,
     };
@@ -618,6 +618,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if data.state.workspace_transition.active {
                 data.state.workspace_transition.tick();
                 data.state.needs_redraw = true;
+            }
+
+                        // ── Tick gesture snap animation (Phase 33) ──
+            if data.state.gesture_swipe.animating {
+                let still_animating = data.state.gesture_swipe.tick();
+                data.state.needs_redraw = true;
+
+                if !still_animating {
+                    // Animation completed — apply the workspace switch if pending
+                    if let Some(target) = data.state.gesture_pending_switch.take() {
+                        let _origin = data.state.gesture_swipe.origin_workspace;
+                        data.state.gesture_swipe.reset();
+
+                        // Perform the actual workspace switch (without triggering
+                        // the old slide animation)
+                        if target < data.state.workspaces.len()
+                            && target != data.state.active_workspace
+                        {
+                            data.state.active_workspace = target;
+
+                            let focus = data.state.workspaces[target]
+                                .windows
+                                .last()
+                                .and_then(|w| w.toplevel())
+                                .map(|t| t.wl_surface().clone());
+                            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                            let keyboard = data.state.keyboard.clone();
+                            keyboard.set_focus(&mut data.state, focus, serial);
+
+                            data.state.recalculate_layout();
+                            data.state.broadcast_workspace_state();
+                        }
+                    } else {
+                        data.state.gesture_swipe.reset();
+                    }
+                    data.state.needs_redraw = true;
+                }
             }
 
             // ── Reap completed dying window animations ──
@@ -973,15 +1010,76 @@ fn render_frame(data: &mut CalloopData) {
     );
     all_elements.push(OutputRenderElements::Cursor(cursor_elem));
 
-    if state.workspace_transition.active {
+    // ── Workspace rendering: gesture → transition → static ──
+    if state.gesture_swipe.needs_render() {
+        // ── Phase 33: 1-to-1 gesture rendering ──
+        let offset = state.gesture_swipe.current_offset() as i32;
+        let origin = state.gesture_swipe.origin_workspace;
+        let max_ws = state.workspaces.len().saturating_sub(1);
+
+        let adjacent_ws: Option<usize> = if offset > 0 && origin > 0 {
+            Some(origin - 1)
+        } else if offset < 0 && origin < max_ws {
+            Some(origin + 1)
+        } else {
+            None
+        };
+
+        // Render origin workspace (shifted by offset)
+        {
+            let origin_space = &state.workspaces[origin].space;
+            let spaces = [origin_space];
+            if let Ok(elements) = space_render_elements(
+                &mut state.renderer, spaces, &state.output, global_opacity,
+            ) {
+                let borders = build_border_and_glow_elements(
+                    &state.workspaces[origin], border_width, &focused_surface,
+                    &active_color, &inactive_color, offset, now, global_opacity,
+                );
+                for elem in elements {
+                    all_elements.push(relocate_space_element(elem, offset));
+                }
+                all_elements.extend(borders);
+            }
+            all_elements.extend(build_dying_window_elements(
+                &state.workspaces[origin], now, offset, global_opacity,
+            ));
+        }
+
+        // Render adjacent workspace (positioned next to origin)
+        if let Some(adj) = adjacent_ws {
+            let adj_offset = if offset > 0 {
+                offset - screen_width
+            } else {
+                offset + screen_width
+            };
+
+            let adj_space = &state.workspaces[adj].space;
+            let spaces = [adj_space];
+            if let Ok(elements) = space_render_elements(
+                &mut state.renderer, spaces, &state.output, global_opacity,
+            ) {
+                let borders = build_border_and_glow_elements(
+                    &state.workspaces[adj], border_width, &focused_surface,
+                    &active_color, &inactive_color, adj_offset, now, global_opacity,
+                );
+                for elem in elements {
+                    all_elements.push(relocate_space_element(elem, adj_offset));
+                }
+                all_elements.extend(borders);
+            }
+            all_elements.extend(build_dying_window_elements(
+                &state.workspaces[adj], now, adj_offset, global_opacity,
+            ));
+        }
+    } else if state.workspace_transition.active {
         let transition = state.workspace_transition.clone();
         let from_offset = transition.from_offset(screen_width);
         let to_offset = transition.to_offset(screen_width);
         let from_ws = transition.from_workspace;
         let to_ws = transition.to_workspace;
 
-        // "from" workspace
-                let from_space = &state.workspaces[from_ws].space;
+        let from_space = &state.workspaces[from_ws].space;
         let from_spaces = [from_space];
         if let Ok(from_elements) = space_render_elements(
             &mut state.renderer, from_spaces, &state.output, global_opacity,
@@ -995,12 +1093,10 @@ fn render_frame(data: &mut CalloopData) {
             }
             all_elements.extend(from_borders);
         }
-
         all_elements.extend(build_dying_window_elements(
             &state.workspaces[from_ws], now, from_offset, global_opacity,
         ));
 
-        // "to" workspace
         let to_space = &state.workspaces[to_ws].space;
         let to_spaces = [to_space];
         if let Ok(to_elements) = space_render_elements(
@@ -1015,11 +1111,10 @@ fn render_frame(data: &mut CalloopData) {
             }
             all_elements.extend(to_borders);
         }
-
         all_elements.extend(build_dying_window_elements(
             &state.workspaces[to_ws], now, to_offset, global_opacity,
         ));
-        } else {
+    } else {
         let active_ws_idx = state.active_workspace;
         let active_space = &state.workspaces[active_ws_idx].space;
         let spaces = [active_space];
@@ -1030,7 +1125,6 @@ fn render_frame(data: &mut CalloopData) {
                     &focused_surface, &active_color, &inactive_color, 0, now,
                     global_opacity,
                 );
-
                 all_elements.extend(border_elements);
 
                 let fade_in_overlays = build_fade_in_overlays(
@@ -1048,7 +1142,6 @@ fn render_frame(data: &mut CalloopData) {
                 return;
             }
         }
-
         all_elements.extend(build_dying_window_elements(
             &state.workspaces[active_ws_idx], now, 0, global_opacity,
         ));
@@ -1064,6 +1157,7 @@ fn render_frame(data: &mut CalloopData) {
         Ok(frame) => {
             if frame.is_empty
                 && !state.workspace_transition.active
+                && !state.gesture_swipe.needs_render()
                 && !state.any_animating()
             {
                 trace!("no damage — VBlank loop paused");
@@ -1081,6 +1175,8 @@ fn render_frame(data: &mut CalloopData) {
     }
 
     // ── Send frame callbacks ──
+    // NOTE: `output` and `elapsed` are defined HERE, so all frame-callback
+    // blocks must come AFTER this point.
     let elapsed = state.start_time.elapsed();
     let output = state.output.clone();
 
@@ -1101,6 +1197,21 @@ fn render_frame(data: &mut CalloopData) {
                     Some(output.clone())
                 });
             });
+        }
+    }
+
+    // ── Send frame callbacks to gesture-adjacent workspace ──
+    if state.gesture_swipe.needs_render() {
+        let max_ws = state.workspaces.len().saturating_sub(1);
+        let adj = state.gesture_swipe.adjacent_workspace(max_ws);
+        if let Some(adj_idx) = adj {
+            if adj_idx != state.active_workspace {
+                state.workspaces[adj_idx].space.elements().for_each(|window| {
+                    window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+                        Some(output.clone())
+                    });
+                });
+            }
         }
     }
 

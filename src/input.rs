@@ -827,67 +827,123 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
         // Touchpad 3-finger swipe → workspace switching
         // ─────────────────────────────────────────────────────────
 
+                // ─────────────────────────────────────────────────────────
+        // Phase 33: 1-to-1 touchpad workspace gesture
+        // ─────────────────────────────────────────────────────────
+
         InputEvent::GestureSwipeBegin { event } => {
             let fingers = event.fingers();
             debug!(fingers, "gesture swipe begin");
-            if fingers == 3 {
-                state.swipe_active = true;
-                state.swipe_fingers = fingers;
-                state.swipe_dx = 0.0;
+            if fingers == 3 || fingers == 4 {
+                // Determine screen width for this gesture
+                let screen_w = state.workspaces[state.active_workspace]
+                    .space
+                    .output_geometry(&state.output)
+                    .map(|g| g.size.w as f64)
+                    .unwrap_or(1920.0);
+
+                state.gesture_swipe = crate::state::GestureSwipeState {
+                    tracking: true,
+                    fingers,
+                    cumulative_dx: 0.0,
+                    origin_workspace: state.active_workspace,
+                    screen_width: screen_w,
+                    animating: false,
+                    anim_start_offset: 0.0,
+                    anim_target_offset: 0.0,
+                    anim_start_time: Instant::now(),
+                    anim_duration: Duration::from_millis(300),
+                };
+                state.gesture_start_time = Instant::now();
             }
         }
 
         InputEvent::GestureSwipeUpdate { event } => {
-            if state.swipe_active {
+            if state.gesture_swipe.tracking {
                 let dx = event.delta_x();
-                state.swipe_dx += dx;
+                let new_offset = state.gesture_swipe.cumulative_dx + dx;
+
+                // Clamp: don't scroll past the first or last workspace
+                let max_ws = state.workspaces.len().saturating_sub(1);
+                let origin = state.gesture_swipe.origin_workspace;
+                let screen_w = state.gesture_swipe.screen_width;
+
+                let clamped = if origin == 0 {
+                    // Can't go further right (no workspace to the left)
+                    new_offset.min(0.0).max(-screen_w)
+                } else if origin >= max_ws {
+                    // Can't go further left (no workspace to the right)
+                    new_offset.max(0.0).min(screen_w)
+                } else {
+                    new_offset.clamp(-screen_w, screen_w)
+                };
+
+                // Apply rubber-band at the edges for a premium feel
+                state.gesture_swipe.cumulative_dx = if (origin == 0 && new_offset > 0.0)
+                    || (origin >= max_ws && new_offset < 0.0)
+                {
+                    // Rubber-band: only 20% of the overscroll delta
+                    state.gesture_swipe.cumulative_dx + dx * 0.2
+                } else {
+                    clamped
+                };
+
                 trace!(
                     dx,
-                    accumulated = state.swipe_dx,
-                    "gesture swipe update"
+                    offset = state.gesture_swipe.cumulative_dx,
+                    "gesture swipe update (1-to-1)"
                 );
+                state.needs_redraw = true;
             }
         }
 
-                InputEvent::GestureSwipeEnd { event } => {
-            if state.swipe_active {
+        InputEvent::GestureSwipeEnd { event } => {
+            if state.gesture_swipe.tracking {
                 let cancelled = event.cancelled();
+                let gesture_duration = state.gesture_start_time.elapsed().as_millis() as f64;
+
                 debug!(
-                    swipe_dx = state.swipe_dx,
+                    offset = state.gesture_swipe.cumulative_dx,
                     cancelled,
+                    duration_ms = gesture_duration,
                     "gesture swipe end"
                 );
 
-                if !cancelled {
-                    let threshold = state.config.swipe_threshold;
-                    if state.swipe_dx > threshold {
-                        // Swiped right → previous workspace
-                        info!(
-                            swipe_dx = state.swipe_dx,
-                            "3-finger swipe right → workspace prev"
-                        );
-                        let current = state.active_workspace;
-                        if current > 0 {
-                            state.switch_workspace(current - 1);
+                if cancelled {
+                    // Cancelled gesture → snap back
+                    state.gesture_swipe.tracking = false;
+                    state.gesture_swipe.animating = true;
+                    state.gesture_swipe.anim_start_offset =
+                        state.gesture_swipe.cumulative_dx;
+                    state.gesture_swipe.anim_target_offset = 0.0;
+                    state.gesture_swipe.anim_start_time = Instant::now();
+                    state.gesture_swipe.anim_duration = Duration::from_millis(200);
+                    state.gesture_pending_switch = None;
+                } else {
+                    let max_ws = state.workspaces.len().saturating_sub(1);
+                    let outcome = state.gesture_swipe.finish(gesture_duration);
+                    match outcome {
+                        crate::state::GestureOutcome::SwitchTo(target) => {
+                            if target <= max_ws {
+                                info!(
+                                    from = state.gesture_swipe.origin_workspace + 1,
+                                    to = target + 1,
+                                    "gesture: committing workspace switch"
+                                );
+                                state.gesture_pending_switch = Some(target);
+                            } else {
+                                // Out of bounds, snap back
+                                state.gesture_swipe.anim_target_offset = 0.0;
+                                state.gesture_pending_switch = None;
+                            }
                         }
-                    } else if state.swipe_dx < -threshold {
-                        // Swiped left → next workspace
-                        info!(
-                            swipe_dx = state.swipe_dx,
-                            "3-finger swipe left → workspace next"
-                        );
-                        let current = state.active_workspace;
-                        let max = state.workspaces.len().saturating_sub(1);
-                        if current < max {
-                            state.switch_workspace(current + 1);
+                        crate::state::GestureOutcome::SnapBack => {
+                            info!("gesture: snapping back to origin workspace");
+                            state.gesture_pending_switch = None;
                         }
                     }
                 }
-
-                // Always reset state
-                state.swipe_active = false;
-                state.swipe_fingers = 0;
-                state.swipe_dx = 0.0;
+                state.needs_redraw = true;
             }
         }
 
