@@ -484,20 +484,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut libinput_context = libinput_context.clone();
         move |event, &mut (), data: &mut CalloopData| match event {
             SessionEvent::PauseSession => {
-                info!("session paused (VT switch out); suspending libinput");
+                info!("session: PauseSession — releasing DRM + suspending input");
+                data.state.session_paused = true;
                 libinput_context.suspend();
+
+                // Tell the DRM compositor to stop — libseat will release DRM master
+                // automatically, but we must not submit any more frames.
+                data.backend.pending_frame = false;
             }
             SessionEvent::ActivateSession => {
-                info!("session activated (VT switch in); resuming libinput + DRM");
+                info!("session: ActivateSession — reacquiring DRM + resuming input");
+                data.state.session_paused = false;
+
+                // Resume libinput so keyboard/pointer events flow again
                 if let Err(err) = libinput_context.resume() {
-                    warn!(?err, "libinput resume failed");
+                    warn!(?err, "session: libinput resume failed");
                 }
+
+                // Reset the DRM compositor state — this re-applies the CRTC
+                // configuration now that we have DRM master back
                 if let Err(err) = data.backend.compositor.reset_state() {
-                    warn!(?err, "DRM: reset_state on activate failed");
+                    warn!(?err, "session: DRM reset_state on activate failed");
                 }
+
+                // Force a full redraw on the next loop iteration
                 data.backend.pending_frame = false;
                 data.state.needs_redraw = true;
-                render_frame(data);
             }
         }
     })?;
@@ -573,6 +585,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lua,
         needs_redraw: true,
         renderer,
+        session: session.clone(),
+        session_paused: false,
         pointer_grab: None,
         gesture_swipe: state::GestureSwipeState::default(),
         gesture_start_time: Instant::now(),
@@ -987,6 +1001,12 @@ fn render_frame(data: &mut CalloopData) {
     if backend.pending_frame {
         return;
     }
+
+    if state.session_paused {
+        trace!("session paused — skipping render");
+        return;
+    }
+
 
     let now = Instant::now();
     let border_width = state.config.border_width.max(0);

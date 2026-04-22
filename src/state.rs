@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
-
+use smithay::backend::session::libseat::LibSeatSession;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 
@@ -520,6 +520,9 @@ pub struct State {
 
     pub needs_redraw: bool,
     pub renderer: GlesRenderer,
+
+    pub session: LibSeatSession,
+    pub session_paused: bool,
 
     pub pointer_grab: Option<GrabState>,
 

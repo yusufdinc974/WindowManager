@@ -3,6 +3,7 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use smithay::backend::session::Session;
 use serde::Deserialize;
 
 use smithay::{
@@ -58,6 +59,8 @@ pub enum KeyAction {
     CycleTheme,
     ToggleNavbar,
     ToggleWallpaperMenu,
+    /// VT/TTY switch (Phase 35)
+    SwitchVt(i32),
     /// Intercepted but already handled inline by the keyboard filter.
     NoOp,
 }
@@ -181,6 +184,27 @@ fn handle_keybinding(
         return FilterResult::Forward;
     }
 
+    if mods.ctrl && mods.alt && !mods.logo {
+        let vt = match sym {
+            Keysym::XF86_Switch_VT_1  | Keysym::F1  => Some(1),
+            Keysym::XF86_Switch_VT_2  | Keysym::F2  => Some(2),
+            Keysym::XF86_Switch_VT_3  | Keysym::F3  => Some(3),
+            Keysym::XF86_Switch_VT_4  | Keysym::F4  => Some(4),
+            Keysym::XF86_Switch_VT_5  | Keysym::F5  => Some(5),
+            Keysym::XF86_Switch_VT_6  | Keysym::F6  => Some(6),
+            Keysym::XF86_Switch_VT_7  | Keysym::F7  => Some(7),
+            Keysym::XF86_Switch_VT_8  | Keysym::F8  => Some(8),
+            Keysym::XF86_Switch_VT_9  | Keysym::F9  => Some(9),
+            Keysym::XF86_Switch_VT_10 | Keysym::F10 => Some(10),
+            Keysym::XF86_Switch_VT_11 | Keysym::F11 => Some(11),
+            Keysym::XF86_Switch_VT_12 | Keysym::F12 => Some(12),
+            _ => None,
+        };
+        if let Some(vt_num) = vt {
+            return FilterResult::Intercept(KeyAction::SwitchVt(vt_num));
+        }
+    }
+
     // Build the lookup key from current modifier state + key name.
     // Try modified sym first, then raw sym for shifted keys (e.g., Shift+1).
     let key_name = keysym_to_key_name(sym);
@@ -272,6 +296,12 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
         }
         KeyAction::ToggleWallpaperMenu => {      
             state.toggle_wallpaper_menu();
+        }
+        KeyAction::SwitchVt(vt) => {
+            info!(vt, "switching to VT");
+            if let Err(err) = state.session.change_vt(vt) {
+                warn!(?err, vt, "failed to switch VT");
+            }
         }
         KeyAction::NoOp => {}
     }
