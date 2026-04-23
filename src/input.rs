@@ -235,15 +235,32 @@ fn handle_keybinding(
     let on_layer = state.layer_has_keyboard_focus();
 
     // Escape on layer surface → dismiss
-    if sym == Keysym::Escape && !mods.logo && !mods.ctrl && !mods.alt && !mods.shift {
+        if sym == Keysym::Escape && !mods.logo && !mods.ctrl && !mods.alt && !mods.shift {
         if on_layer {
             if let Some(focused) = state.keyboard.current_focus() {
                 if let Some(layer) = state.layer_surface_of(&focused) {
-                    info!("Escape pressed on layer surface — closing");
-                    layer.layer_surface().send_close();
-                    state.drop_focus_to_active_window();
-                    state.needs_redraw = true;
-                    return FilterResult::Intercept(KeyAction::NoOp);
+                    // Only dismiss overlay/popup layer surfaces, NOT persistent bars
+                    let dominated_layer = matches!(
+                        layer.layer(),
+                        smithay::wayland::shell::wlr_layer::Layer::Overlay
+                    );
+                    let has_exclusive_kb = matches!(
+                        layer.cached_state().keyboard_interactivity,
+                        smithay::wayland::shell::wlr_layer::KeyboardInteractivity::Exclusive
+                    );
+                    if dominated_layer || has_exclusive_kb {
+                        info!("Escape pressed on popup layer surface — closing");
+                        layer.layer_surface().send_close();
+                        state.drop_focus_to_active_window();
+                        state.needs_redraw = true;
+                        return FilterResult::Intercept(KeyAction::NoOp);
+                    } else {
+                        // Persistent layer (like Waybar) — just release focus back
+                        info!("Escape on persistent layer surface — releasing focus only");
+                        state.drop_focus_to_active_window();
+                        state.needs_redraw = true;
+                        return FilterResult::Intercept(KeyAction::NoOp);
+                    }
                 }
             }
         }
@@ -921,12 +938,23 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
                         map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL).is_some()
                     };
                     if !is_layer {
-                        // Clicked outside the layer surface — dismiss it
-                        // and focus the window underneath.
+                        // Clicked outside — only CLOSE overlay/exclusive popups,
+                        // just release focus for persistent bars like Waybar.
                         if let Some(focused) = state.keyboard.current_focus() {
                             if let Some(layer) = state.layer_surface_of(&focused) {
-                                info!("click outside layer surface — closing it");
-                                layer.layer_surface().send_close();
+                                let is_popup = matches!(
+                                    layer.layer(),
+                                    smithay::wayland::shell::wlr_layer::Layer::Overlay
+                                ) || matches!(
+                                    layer.cached_state().keyboard_interactivity,
+                                    smithay::wayland::shell::wlr_layer::KeyboardInteractivity::Exclusive
+                                );
+                                if is_popup {
+                                    info!("click outside popup layer surface — closing it");
+                                    layer.layer_surface().send_close();
+                                } else {
+                                    info!("click outside persistent layer surface — releasing focus only");
+                                }
                             }
                         }
                         state.drop_focus_to_active_window();

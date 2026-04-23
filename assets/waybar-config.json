@@ -50,7 +50,7 @@
         "interval": 1,
         "exec": "cat ${XDG_RUNTIME_DIR:-/tmp}/lumie-opacity.json 2>/dev/null || echo '{\"text\":\"100%\",\"tooltip\":\"Opacity\",\"percentage\":100}'",
         "return-type": "json",
-        "format": "OP {}",
+        "format": "💧 {}",
         "tooltip": true,
         "on-click": "bash $HOME/.config/lumie/scripts/lumie-opacity-control.sh",
         "on-click-right": "python3 -c \"import socket,json;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect('/tmp/lumie.sock');s.sendall(json.dumps({'SetOpacity':{'value':1.0}}).encode());s.close()\"",
@@ -67,9 +67,9 @@
     },
 
     "pulseaudio": {
-        "format": "VOL {volume}%",
-        "format-bluetooth": "BT {volume}%",
-        "format-muted": "MUTE",
+        "format": "🔊 {volume}%",
+        "format-bluetooth": "🎧 {volume}%",
+        "format-muted": "🔇 Mute",
         "format-icons": {
             "default": [""]
         },
@@ -79,9 +79,9 @@
     },
 
     "network": {
-        "format-wifi": "WiFi {signalStrength}%",
-        "format-ethernet": "ETH {ifname}",
-        "format-disconnected": "OFFLINE",
+        "format-wifi": "📶 {signalStrength}%",
+        "format-ethernet": "🌐 {ifname}",
+        "format-disconnected": "❌ Offline",
         "tooltip-format-wifi": "{essid} ({signalStrength}%)\n{ipaddr}/{cidr}",
         "tooltip-format-ethernet": "{ifname}\n{ipaddr}/{cidr}",
         "tooltip-format-disconnected": "Disconnected",
@@ -94,9 +94,9 @@
             "warning": 30,
             "critical": 15
         },
-        "format": "BAT {capacity}%",
-        "format-charging": "CHG {capacity}%",
-        "format-plugged": "PLG {capacity}%",
+        "format": "🔋 {capacity}%",
+        "format-charging": "⚡ {capacity}%",
+        "format-plugged": "🔌 {capacity}%",
         "format-icons": [""],
         "tooltip-format": "{timeTo}\n{power:.1f}W"
     },

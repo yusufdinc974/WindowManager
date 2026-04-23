@@ -700,19 +700,17 @@ fn handle_layer_commit(
 
     let interactivity = layer.cached_state().keyboard_interactivity;
     let focus_target = match interactivity {
-        KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand => {
+        KeyboardInteractivity::Exclusive => {
+            // Only exclusive grabs (launchers, menus) should steal focus
             Some(layer.wl_surface().clone())
         }
+        KeyboardInteractivity::OnDemand => {
+            // OnDemand surfaces (like Waybar) should NOT auto-steal focus
+            // on every commit — they get focus only via explicit click
+            None
+        }
         KeyboardInteractivity::None => {
-            if layer.can_receive_keyboard_focus() {
-                debug!(
-                    surface = ?surface.id(),
-                    "layer commit: cached_state says None but can_receive_keyboard_focus is true"
-                );
-                Some(layer.wl_surface().clone())
-            } else {
-                None
-            }
+            None
         }
     };
 
