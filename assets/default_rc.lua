@@ -276,6 +276,47 @@ local function lumie_cache_dir()
     return real_home_dir() .. "/.cache/lumie"
 end
 
+-- ── Helper: find theme index by name ──
+local function theme_index_by_name(name)
+    for i, t in ipairs(themes) do
+        if t.name == name then return i end
+    end
+    return nil
+end
+
+-- ── Restore last theme from cache, or default to 1 ──
+local function restore_theme_index()
+    local cache = lumie_cache_dir() .. "/current_theme.txt"
+    local f = io.open(cache, "r")
+    if f then
+        local name = f:read("*l")
+        f:close()
+        if name and name ~= "" then
+            local idx = theme_index_by_name(name)
+            if idx then
+                print("theme: restored '" .. name .. "' (index " .. idx .. ") from cache")
+                return idx
+            end
+        end
+    end
+    return 1
+end
+
+local function save_theme_index(t)
+    local cache_dir = lumie_cache_dir()
+    os.execute('mkdir -p "' .. cache_dir .. '"')
+    local f = io.open(cache_dir .. "/current_theme.txt", "w")
+    if f then
+        f:write(t.name .. "\n")
+        f:close()
+    end
+end
+
+-- Now override the initial theme index with the restored one
+w.__theme_index = restore_theme_index()
+w.active_border_color   = themes[w.__theme_index].active
+w.inactive_border_color = themes[w.__theme_index].inactive
+
 -- ── Helper: hex "#rrggbb" → r, g, b integers ──
 local function hex_to_rgb(hex)
     hex = hex:gsub("^#", "")
@@ -469,14 +510,14 @@ window#osd {
     end
 end
 
--- ── Write initial theme CSS on startup ──
-local ok, err = pcall(write_theme_css, themes[1])
+-- ── Write initial theme CSS on startup (using restored theme) ──
+local ok, err = pcall(write_theme_css, themes[w.__theme_index])
 if not ok then
     print("theme: skipping initial write (waybar dir not ready yet — this is normal)")
 end
 
 -- Write initial SwayOSD CSS on startup
-local ok2, err2 = pcall(write_swayosd_css, themes[1])
+local ok2, err2 = pcall(write_swayosd_css, themes[w.__theme_index])
 if not ok2 then
     print("swayosd: skipping initial write — " .. tostring(err2))
 end
@@ -606,6 +647,12 @@ function toggle_wallpaper_menu()
     end
 end
 
+-- ── Called by compositor after sandbox HOME is ready ──
+function rewrite_current_theme_css()
+    pcall(write_theme_css, themes[w.__theme_index])
+    pcall(write_swayosd_css, themes[w.__theme_index])
+end
+
 -- ============================================================
 --  Theme Cycling (Super + T) — updated with wallpaper + OSD hooks
 -- ============================================================
@@ -629,6 +676,9 @@ function cycle_theme()
 
     -- ── Wallpaper: switch to theme-appropriate wallpaper ──
     restore_wallpaper_for_theme(t.name)
+
+    -- Persist theme choice for next session
+    save_theme_index(t)
 
     print(string.format("theme -> %s  active=%s inactive=%s",
           t.name, t.active, t.inactive))
@@ -657,8 +707,8 @@ end
 w.autostart = {
     "/bin/bash -c 'exec waybar > /tmp/waybar-stderr.log 2>&1'",
     string.format(
-        '/bin/bash -c "sleep 0.5; %s/scripts/wallpaper-restore.sh %s"',
-        lumie_config_dir(), themes[w.__theme_index].name
+        '/bin/bash -c "sleep 0.3; swaybg -i \\"$(cat %s/wallpaper_%s.txt 2>/dev/null)\\" -m fill"',
+        lumie_cache_dir(), themes[w.__theme_index].name
     ),
 }
 

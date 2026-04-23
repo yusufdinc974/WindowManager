@@ -383,6 +383,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     isolate_session_environment(&socket_name);
     ensure_waybar_config();
 
+    // Re-write correct theme CSS now that HOME points to sandbox
+    if let Err(err) = lua.load(
+        "if type(rewrite_current_theme_css) == 'function' then rewrite_current_theme_css() end"
+    ).exec() {
+        warn!(?err, "failed to rewrite theme CSS after sandbox setup");
+    }
+
     event_loop
         .handle()
         .insert_source(listening_socket, |stream, _meta, data| {
