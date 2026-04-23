@@ -180,3 +180,81 @@ action = "move_to_workspace_8"
 modifiers = { logo = true, shift = true }
 key = "9"
 action = "move_to_workspace_9"
+
+# ── Phase 34: Media & Brightness keys ──
+# Using direct commands (wpctl/brightnessctl) as primary,
+# with swayosd-client as OSD overlay when server is available.
+
+# ── Media & Brightness keys (native OSD) ──
+
+[[keybinds]]
+modifiers = {}
+key = "xf86audioraisevolume"
+action = "volume_up"
+
+[[keybinds]]
+modifiers = {}
+key = "xf86audiolowervolume"
+action = "volume_down"
+
+[[keybinds]]
+modifiers = {}
+key = "xf86audiomute"
+action = "volume_mute"
+
+[[keybinds]]
+modifiers = {}
+key = "xf86audiomicmute"
+action = "exec:wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"
+
+[[keybinds]]
+modifiers = {}
+key = "xf86audioplay"
+action = "exec:playerctl play-pause"
+
+[[keybinds]]
+modifiers = {}
+key = "xf86audionext"
+action = "exec:playerctl next"
+
+[[keybinds]]
+modifiers = {}
+key = "xf86audioprev"
+action = "exec:playerctl previous"
+
+[[keybinds]]
+modifiers = {}
+key = "xf86monbrightnessup"
+action = "brightness_up"
+
+[[keybinds]]
+modifiers = {}
+key = "xf86monbrightnessdown"
+action = "brightness_down"
+
+# ── Fallback F-key bindings ──
+
+[[keybinds]]
+modifiers = {}
+key = "f10"
+action = "volume_up"
+
+[[keybinds]]
+modifiers = {}
+key = "f9"
+action = "volume_down"
+
+[[keybinds]]
+modifiers = {}
+key = "f8"
+action = "volume_mute"
+
+[[keybinds]]
+modifiers = {}
+key = "f12"
+action = "brightness_up"
+
+[[keybinds]]
+modifiers = {}
+key = "f11"
+action = "brightness_down"

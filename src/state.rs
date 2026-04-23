@@ -61,6 +61,68 @@ pub const ANIMATION_START_SCALE: f32 = 0.8;
 /// Duration for fade-out animation before a window is fully removed.
 pub const FADE_OUT_DURATION: Duration = Duration::from_millis(200);
 
+
+
+
+// ── Native OSD overlay ──
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OsdKind {
+    Volume,
+    Brightness,
+}
+
+#[derive(Debug, Clone)]
+pub struct OsdState {
+    pub kind: OsdKind,
+    pub value: f32,      // 0.0 – 1.0
+    pub muted: bool,
+    pub show_time: Instant,
+    pub visible: bool,
+}
+
+impl Default for OsdState {
+    fn default() -> Self {
+        Self {
+            kind: OsdKind::Volume,
+            value: 0.0,
+            muted: false,
+            show_time: Instant::now(),
+            visible: false,
+        }
+    }
+}
+
+impl OsdState {
+    pub fn show(&mut self, kind: OsdKind, value: f32, muted: bool) {
+        self.kind = kind;
+        self.value = value.clamp(0.0, 1.0);
+        self.muted = muted;
+        self.show_time = Instant::now();
+        self.visible = true;
+    }
+
+    /// Returns current alpha (0.0 = hidden, 1.0 = fully visible).
+    /// Fades out over the last 500ms of a 2-second display.
+    pub fn alpha(&self) -> f32 {
+        if !self.visible { return 0.0; }
+        let elapsed = self.show_time.elapsed().as_secs_f32();
+        if elapsed > 2.0 {
+            0.0
+        } else if elapsed > 1.5 {
+            1.0 - ((elapsed - 1.5) / 0.5)
+        } else {
+            1.0
+        }
+    }
+
+    pub fn tick(&mut self) {
+        if self.visible && self.show_time.elapsed().as_secs_f32() > 2.0 {
+            self.visible = false;
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // Dying window (fade-out tracking)
 // -------------------------------------------------------------------------
@@ -536,9 +598,9 @@ pub struct State {
     pub workspace_transition: WorkspaceTransition,
 
     // ── Phase 29: Global window opacity (controlled via IPC / Waybar) ──
-    pub window_opacity: f32,
+        pub window_opacity: f32,
+        pub osd: OsdState,
 }
-
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
@@ -546,10 +608,10 @@ pub struct ClientState {
 
 impl ClientData for ClientState {
     fn initialized(&self, client_id: ClientId) {
-        tracing::info!(?client_id, "wayland client initialized");
+        tracing::trace!(?client_id, "wayland client initialized");
     }
     fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
-        tracing::warn!(?client_id, ?reason, "wayland client DISCONNECTED");
+        tracing::trace!(?client_id, ?reason, "wayland client disconnected");
     }
 }
 

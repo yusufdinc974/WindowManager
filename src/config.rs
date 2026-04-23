@@ -43,7 +43,7 @@ pub struct Modifiers {
 
 impl Default for Modifiers {
     fn default() -> Self {
-        Self { logo: true, shift: false, ctrl: false, alt: false }
+        Self { logo: false, shift: false, ctrl: false, alt: false }
     }
 }
 
@@ -160,6 +160,73 @@ impl Config {
                 Self::default()
             }
         }
+    }
+
+    /// Create a new Lua VM, deploy assets, parse TOML, run rc.lua, and
+    /// return the `(Lua, Config)` pair ready for the session.
+    pub fn load_from_lua() -> (Lua, Config) {
+        let lua = Lua::new();
+        let mut config = Self::from_asset();
+
+        // Deploy assets first
+        Self::deploy_assets();
+
+        // Try to load user's TOML (overrides compiled-in asset defaults)
+        if let Some(toml_path) = toml_path() {
+            if toml_path.exists() {
+                match fs::read_to_string(&toml_path) {
+                    Ok(contents) => match toml::from_str::<Config>(&contents) {
+                        Ok(toml_config) => {
+                            info!(?toml_path, "config: loaded config.toml");
+                            config = toml_config;
+                        }
+                        Err(err) => {
+                            warn!(?toml_path, %err, "config: config.toml parse error");
+                        }
+                    },
+                    Err(err) => {
+                        warn!(?toml_path, ?err, "config: failed to read config.toml");
+                    }
+                }
+            }
+        }
+
+        // Seed the wm table into Lua so rc.lua can read/override values
+        if let Err(err) = seed_wm_table(&lua, &config) {
+            warn!(?err, "config: failed to seed wm table");
+            return (lua, config);
+        }
+
+        // Run rc.lua on top
+        if let Some(path) = rc_path() {
+            if path.exists() {
+                match fs::read_to_string(&path) {
+                    Ok(source) => {
+                        if let Err(err) = lua.load(&source).set_name("rc.lua").exec() {
+                            warn!(?path, error = %err, "config: rc.lua execution failed");
+                        } else {
+                            info!(?path, "config: loaded rc.lua");
+                            config.refresh_from_lua(&lua);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(?path, ?err, "config: failed to read rc.lua");
+                    }
+                }
+            }
+        }
+
+        info!(
+            terminal = %config.terminal,
+            border = config.border_width,
+            active = %config.active_border_color,
+            inactive = %config.inactive_border_color,
+            gaps = ?(config.outer_gaps, config.inner_gaps),
+            workspaces = config.workspace_count(),
+            "config: initial load complete"
+        );
+
+        (lua, config)
     }
 
     pub fn workspace_count(&self) -> usize {
@@ -299,73 +366,6 @@ impl Config {
     }
 
     /// Load configuration: deploy assets, parse TOML, then run Lua on top.
-    pub fn load_from_lua() -> (Lua, Self) {
-        Self::deploy_assets();
-
-        let mut config = Self::from_asset();
-
-        if let Some(toml_path) = toml_path() {
-            if toml_path.exists() {
-                match fs::read_to_string(&toml_path) {
-                    Ok(contents) => match toml::from_str::<Config>(&contents) {
-                        Ok(toml_config) => {
-                            info!(?toml_path, "config: loaded config.toml");
-                            config = toml_config;
-                        }
-                        Err(err) => {
-                            warn!(
-                                ?toml_path, %err,
-                                "config: config.toml parse error, using asset defaults"
-                            );
-                        }
-                    },
-                    Err(err) => {
-                        warn!(?toml_path, ?err, "config: failed to read config.toml");
-                    }
-                }
-            }
-        }
-
-        let lua = unsafe { Lua::unsafe_new() };
-
-        if let Err(err) = seed_wm_table(&lua, &config) {
-            warn!(?err, "config: failed to seed `wm` table");
-            return (lua, config);
-        }
-
-        if let Some(path) = rc_path() {
-            if path.exists() {
-                match fs::read_to_string(&path) {
-                    Ok(source) => {
-                        if let Err(err) = lua.load(&source).set_name("rc.lua").exec() {
-                            warn!(?path, error = %err, "config: rc.lua execution failed");
-                        } else {
-                            info!(?path, "config: rc.lua loaded");
-                            match read_config_from_lua(&lua) {
-                                Ok(lua_config) => config = lua_config,
-                                Err(err) => {
-                                    warn!(?err, "config: could not read back wm table");
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!(?path, ?err, "config: failed to read rc.lua");
-                    }
-                }
-            }
-        }
-
-        (lua, config)
-    }
-
-    pub fn refresh_from_lua(&mut self, lua: &Lua) {
-        match read_config_from_lua(lua) {
-            Ok(new) => *self = new,
-            Err(err) => warn!(?err, "config: refresh from Lua failed"),
-        }
-    }
-
     pub fn reload(&mut self, lua: &Lua) {
         Self::deploy_assets();
 
@@ -420,6 +420,13 @@ impl Config {
             workspaces = self.workspace_count(),
             "config: reload complete"
         );
+    }
+
+    pub fn refresh_from_lua(&mut self, lua: &Lua) {
+        match read_config_from_lua(lua, self.keybinds.clone()) {
+            Ok(new) => *self = new,
+            Err(err) => warn!(?err, "config: refresh from Lua failed"),
+        }
     }
 
     pub fn keybind_map(&self) -> HashMap<(bool, bool, bool, bool, String), String> {
@@ -487,7 +494,7 @@ fn seed_wm_table(lua: &Lua, config: &Config) -> mlua::Result<()> {
     Ok(())
 }
 
-fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
+fn read_config_from_lua(lua: &Lua, existing_keybinds: Vec<Keybind>) -> mlua::Result<Config> {
     let defaults = Config::default();
     let wm: Table = lua.globals().get("wm")?;
 
@@ -533,7 +540,7 @@ fn read_config_from_lua(lua: &Lua) -> mlua::Result<Config> {
         inactive_border_color,
         clear_color,
         workspace_names,
-        keybinds: defaults.keybinds,
+        keybinds: existing_keybinds,
         swipe_threshold,
     })
 }

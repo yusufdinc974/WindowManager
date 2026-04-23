@@ -541,15 +541,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mlua::Value::Table(cmds)) = autostart_result {
             for cmd in cmds.sequence_values::<String>().flatten() {
                 info!(command = %cmd, "autostart: launching");
-                match std::process::Command::new("sh")
+
+                // swayosd-server needs the real HOME for its config
+                let real_home = std::env::var("lumie_REAL_HOME").unwrap_or_default();
+                let needs_real_home = cmd.contains("swayosd");
+
+                let mut command = std::process::Command::new("/bin/bash");
+                command
                     .arg("-c")
                     .arg(&cmd)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
-                    Ok(child) => info!(pid = child.id(), "autostart: process spawned"),
+                    .stderr(std::process::Stdio::piped());
+
+                if needs_real_home && !real_home.is_empty() {
+                    command.env("HOME", &real_home);
+                    info!(real_home = %real_home, "autostart: using real HOME for swayosd");
+                }
+
+                match command.spawn() {
+                    Ok(child) => {
+                        let pid = child.id();
+                        let cmd_owned = cmd.clone();
+                        info!(pid, "autostart: process spawned");
+                        std::thread::spawn(move || {
+                            match child.wait_with_output() {
+                                Ok(output) if !output.status.success() => {
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    warn!(
+                                        pid,
+                                        command = %cmd_owned,
+                                        exit_code = ?output.status.code(),
+                                        stderr = %stderr.trim(),
+                                        "autostart: process exited with error"
+                                    );
+                                }
+                                Ok(_) => info!(pid, command = %cmd_owned, "autostart: process exited"),
+                                Err(err) => warn!(?err, pid, command = %cmd_owned, "autostart: wait failed"),
+                            }
+                        });
+                    }
                     Err(err) => warn!(?err, "autostart: failed to spawn"),
                 }
             }
@@ -593,6 +624,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gesture_pending_switch: None,
         workspace_transition: state::WorkspaceTransition::default(),
         window_opacity: 1.0,
+        osd: state::OsdState::default(),
     };
 
     let mut data = CalloopData {
@@ -674,6 +706,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // ── Reap completed dying window animations ──
             for ws in data.state.workspaces.iter_mut() {
                 ws.reap_dying_windows();
+            }
+
+                        // ── Tick OSD overlay ──
+            data.state.osd.tick();
+            if data.state.osd.visible {
+                data.state.needs_redraw = true;
             }
 
             if data.state.any_animating() {
@@ -1029,6 +1067,15 @@ fn render_frame(data: &mut CalloopData) {
         &state.cursor_buffer, cursor_loc, 1.0, 1.0, Kind::Cursor,
     );
     all_elements.push(OutputRenderElements::Cursor(cursor_elem));
+
+    // ── OSD overlay (volume / brightness) — on top of workspace content ──
+    let screen_height = state.workspaces[state.active_workspace]
+        .space
+        .output_geometry(&state.output)
+        .map(|g| g.size.h)
+        .unwrap_or(1080);
+    let osd_elements = build_osd_elements(&state.osd, screen_width, screen_height);
+    all_elements.extend(osd_elements);
 
     // ── Workspace rendering: gesture → transition → static ──
     if state.gesture_swipe.needs_render() {
@@ -1571,6 +1618,160 @@ fn build_dying_window_elements(
             );
             elements.push(OutputRenderElements::Cursor(elem));
         }
+    }
+
+    elements
+}
+
+
+// -------------------------------------------------------------------------
+// OSD (On-Screen Display) overlay for volume / brightness
+// -------------------------------------------------------------------------
+
+fn build_osd_elements(osd: &state::OsdState, screen_w: i32, screen_h: i32) -> Vec<OutputRenderElements> {
+    let alpha = osd.alpha();
+    if alpha < 0.01 {
+        return Vec::new();
+    }
+
+    let mut elements = Vec::new();
+
+    // ── Dimensions ──
+    let bar_width: i32 = 6;
+    let bar_height: i32 = 180;
+    let track_width: i32 = 22;
+    let track_height: i32 = bar_height + 24; // padding above and below the bar
+    let corner_inset: i32 = 30; // distance from right edge
+    let icon_size: i32 = 14;
+    let icon_gap: i32 = 10;
+    let total_height: i32 = track_height + icon_gap + icon_size;
+
+    // Center vertically on screen
+    let base_x = screen_w - corner_inset - track_width / 2;
+    let base_y = (screen_h - total_height) / 2;
+
+    // ── Track background (dark pill) ──
+    let track_x = base_x - track_width / 2;
+    let track_y = base_y;
+    let bg_color = [0.08, 0.08, 0.12, 0.85 * alpha];
+    let bg_buf = SolidColorBuffer::new((track_width, track_height), bg_color);
+    let bg_elem = SolidColorRenderElement::from_buffer(
+        &bg_buf,
+        Point::<i32, Physical>::from((track_x, track_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(bg_elem));
+
+    // ── Track border (subtle outline) ──
+    let border_color = [0.3, 0.3, 0.4, 0.3 * alpha];
+    // Top
+    let buf = SolidColorBuffer::new((track_width, 1), border_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((track_x, track_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+    // Bottom
+    let buf = SolidColorBuffer::new((track_width, 1), border_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((track_x, track_y + track_height - 1)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+    // Left
+    let buf = SolidColorBuffer::new((1, track_height), border_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((track_x, track_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+    // Right
+    let buf = SolidColorBuffer::new((1, track_height), border_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((track_x + track_width - 1, track_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+
+    // ── Filled bar (grows from bottom) ──
+    let bar_x = base_x - bar_width / 2;
+    let bar_area_top = track_y + 12; // top padding inside track
+    let fill_height = ((osd.value * bar_height as f32) as i32).clamp(0, bar_height);
+    let fill_y = bar_area_top + (bar_height - fill_height);
+
+    let fill_color = if osd.muted {
+        // Muted: red-ish
+        [0.95, 0.30, 0.35, 0.9 * alpha]
+    } else {
+        match osd.kind {
+            state::OsdKind::Volume => [0.48, 0.64, 0.97, 0.9 * alpha],     // Blue accent
+            state::OsdKind::Brightness => [0.88, 0.69, 0.41, 0.9 * alpha], // Warm amber
+        }
+    };
+
+    if fill_height > 0 {
+        let fill_buf = SolidColorBuffer::new((bar_width, fill_height), fill_color);
+        let fill_elem = SolidColorRenderElement::from_buffer(
+            &fill_buf,
+            Point::<i32, Physical>::from((bar_x, fill_y)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(fill_elem));
+    }
+
+    // ── Empty track portion (dimmed) ──
+    let empty_height = bar_height - fill_height;
+    if empty_height > 0 {
+        let empty_color = [0.25, 0.25, 0.30, 0.3 * alpha];
+        let empty_buf = SolidColorBuffer::new((bar_width, empty_height), empty_color);
+        let empty_elem = SolidColorRenderElement::from_buffer(
+            &empty_buf,
+            Point::<i32, Physical>::from((bar_x, bar_area_top)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(empty_elem));
+    }
+
+    // ── Indicator dot below the track (shows kind + muted state) ──
+    let dot_x = base_x - icon_size / 2;
+    let dot_y = track_y + track_height + icon_gap;
+
+    let dot_color = if osd.muted {
+        [0.95, 0.30, 0.35, 0.8 * alpha]
+    } else {
+        match osd.kind {
+            state::OsdKind::Volume => [0.48, 0.64, 0.97, 0.7 * alpha],
+            state::OsdKind::Brightness => [0.88, 0.69, 0.41, 0.7 * alpha],
+        }
+    };
+
+    let dot_buf = SolidColorBuffer::new((icon_size, icon_size), dot_color);
+    let dot_elem = SolidColorRenderElement::from_buffer(
+        &dot_buf,
+        Point::<i32, Physical>::from((dot_x, dot_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(dot_elem));
+
+    // If muted, draw an X through the dot (two diagonal-ish lines)
+    if osd.muted {
+        let x_color = [0.08, 0.08, 0.12, 0.9 * alpha];
+        // Horizontal bar through middle
+        let buf = SolidColorBuffer::new((icon_size, 2), x_color);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((dot_x, dot_y + icon_size / 2 - 1)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+        // Vertical bar through middle
+        let buf = SolidColorBuffer::new((2, icon_size), x_color);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((dot_x + icon_size / 2 - 1, dot_y)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
     }
 
     elements

@@ -571,6 +571,28 @@ impl WlrLayerShellHandler for State {
             .and_then(Output::from_resource)
             .unwrap_or_else(|| self.output.clone());
 
+        // ── Phase 34: Pre-configure layer surfaces that request size 0 ──
+        // Some clients (SwayOSD, etc.) create overlay surfaces with width/height
+        // set to 0, expecting the compositor to assign the output dimensions.
+        // Smithay strictly validates that size-0 requires both anchors.
+        // We work around this by sending a configure with the output size
+        // before the map, so the client always has valid dimensions.
+        let output_geo = self.workspaces[self.active_workspace]
+            .space
+            .output_geometry(&output)
+            .unwrap_or_default();
+
+        surface.with_pending_state(|state| {
+            let mut size = state.size.unwrap_or_default();
+            if size.w == 0 {
+                size.w = output_geo.size.w;
+            }
+            if size.h == 0 {
+                size.h = output_geo.size.h;
+            }
+            state.size = Some(size);
+        });
+
         let layer = LayerSurface::new(surface, namespace);
         {
             let mut map = layer_map_for_output(&output);

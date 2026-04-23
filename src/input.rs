@@ -40,7 +40,7 @@ const SWIPE_THRESHOLD: f64 = 100.0;
 // Action / IPC command types
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum KeyAction {
     Quit,
     ReloadConfig,
@@ -61,6 +61,12 @@ pub enum KeyAction {
     ToggleWallpaperMenu,
     /// VT/TTY switch (Phase 35)
     SwitchVt(i32),
+    Exec(String),
+    VolumeUp,
+    VolumeDown,
+    VolumeMute,
+    BrightnessUp,
+    BrightnessDown,
     /// Intercepted but already handled inline by the keyboard filter.
     NoOp,
 }
@@ -113,6 +119,33 @@ fn keysym_to_key_name(sym: Keysym) -> Option<String> {
         Keysym::_7     => Some("7".into()),
         Keysym::_8     => Some("8".into()),
         Keysym::_9     => Some("9".into()),
+
+        // ── F-keys (for laptops where Fn-lock sends F1–F12 by default) ──
+        Keysym::F1     => Some("f1".into()),
+        Keysym::F2     => Some("f2".into()),
+        Keysym::F3     => Some("f3".into()),
+        Keysym::F4     => Some("f4".into()),
+        Keysym::F5     => Some("f5".into()),
+        Keysym::F6     => Some("f6".into()),
+        Keysym::F7     => Some("f7".into()),
+        Keysym::F8     => Some("f8".into()),
+        Keysym::F9     => Some("f9".into()),
+        Keysym::F10    => Some("f10".into()),
+        Keysym::F11    => Some("f11".into()),
+        Keysym::F12    => Some("f12".into()),
+
+
+        Keysym::XF86_AudioRaiseVolume  => Some("xf86audioraisevolume".into()),
+        Keysym::XF86_AudioLowerVolume  => Some("xf86audiolowervolume".into()),
+        Keysym::XF86_AudioMute         => Some("xf86audiomute".into()),
+        Keysym::XF86_AudioMicMute      => Some("xf86audiomicmute".into()),
+        Keysym::XF86_AudioPlay         => Some("xf86audioplay".into()),
+        Keysym::XF86_AudioPause        => Some("xf86audiopause".into()),
+        Keysym::XF86_AudioNext         => Some("xf86audionext".into()),
+        Keysym::XF86_AudioPrev         => Some("xf86audioprev".into()),
+        Keysym::XF86_MonBrightnessUp   => Some("xf86monbrightnessup".into()),
+        Keysym::XF86_MonBrightnessDown => Some("xf86monbrightnessdown".into()),
+
         _ => {
             // For letter keys, get the lowercase character name
             let raw = sym.key_char();
@@ -148,6 +181,21 @@ fn action_string_to_key_action(action: &str) -> Option<KeyAction> {
                 .and_then(|n| n.parse::<usize>().ok())
                 .map(|n| KeyAction::MoveToWorkspace(n.saturating_sub(1)))
         }
+        "volume_up" => Some(KeyAction::VolumeUp),
+        "volume_down" => Some(KeyAction::VolumeDown),
+        "volume_mute" => Some(KeyAction::VolumeMute),
+        "brightness_up" => Some(KeyAction::BrightnessUp),
+        "brightness_down" => Some(KeyAction::BrightnessDown),
+        // ── Phase 34: exec:<command> runs an arbitrary shell command ──
+        s if s.starts_with("exec:") => {
+            let cmd = s.strip_prefix("exec:").unwrap_or("").trim();
+            if cmd.is_empty() {
+                warn!("exec: keybind with empty command");
+                None
+            } else {
+                Some(KeyAction::Exec(cmd.to_string()))
+            }
+        }
         _ => {
             warn!(action, "unknown keybind action");
             None
@@ -166,6 +214,24 @@ fn handle_keybinding(
     }
 
     let sym = keysym_handle.modified_sym();
+
+     // ── Phase 34 DEBUG: log every keypress ──
+    let key_name = keysym_to_key_name(sym);
+    let raw_key_name = keysym_handle
+        .raw_syms()
+        .first()
+        .and_then(|s| keysym_to_key_name(*s));
+    info!(
+        ?sym,
+        ?key_name,
+        ?raw_key_name,
+        logo = mods.logo,
+        shift = mods.shift,
+        ctrl = mods.ctrl,
+        alt = mods.alt,
+        "DEBUG keybind: key pressed"
+    );
+
     let on_layer = state.layer_has_keyboard_focus();
 
     // Escape on layer surface → dismiss
@@ -303,8 +369,93 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
                 warn!(?err, vt, "failed to switch VT");
             }
         }
+
+                // ── Phase 34: Run arbitrary shell command ──
+        KeyAction::Exec(cmd) => {
+            info!(command = %cmd, "exec: spawning command");
+            match Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => {
+                    debug!(pid = child.id(), command = %cmd, "exec: spawned");
+                    let cmd_owned = cmd.clone();
+                    std::thread::spawn(move || {
+                        match child.wait_with_output() {
+                            Ok(output) if !output.status.success() => {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                warn!(
+                                    command = %cmd_owned,
+                                    exit_code = ?output.status.code(),
+                                    stderr = %stderr.trim(),
+                                    "exec: command failed"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => warn!(?err, command = %cmd_owned, "exec: wait failed"),
+                        }
+                    });
+                }
+                Err(err) => warn!(?err, command = %cmd, "exec: failed to spawn"),
+            }
+        }
+
+        KeyAction::VolumeUp => {
+            let _ = Command::new("wpctl")
+                .args(["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let (vol, muted) = query_volume();
+            state.osd.show(crate::state::OsdKind::Volume, vol, muted);
+            state.needs_redraw = true;
+        }
+        KeyAction::VolumeDown => {
+            let _ = Command::new("wpctl")
+                .args(["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let (vol, muted) = query_volume();
+            state.osd.show(crate::state::OsdKind::Volume, vol, muted);
+            state.needs_redraw = true;
+        }
+        KeyAction::VolumeMute => {
+            let _ = Command::new("wpctl")
+                .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let (vol, muted) = query_volume();
+            state.osd.show(crate::state::OsdKind::Volume, vol, muted);
+            state.needs_redraw = true;
+        }
+        KeyAction::BrightnessUp => {
+            let _ = Command::new("brightnessctl")
+                .args(["set", "+5%"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let bri = query_brightness();
+            state.osd.show(crate::state::OsdKind::Brightness, bri, false);
+            state.needs_redraw = true;
+        }
+        KeyAction::BrightnessDown => {
+            let _ = Command::new("brightnessctl")
+                .args(["set", "5%-"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let bri = query_brightness();
+            state.osd.show(crate::state::OsdKind::Brightness, bri, false);
+            state.needs_redraw = true;
+        }
         KeyAction::NoOp => {}
-    }
+        }
 }
 
 // -------------------------------------------------------------------------
@@ -1219,4 +1370,46 @@ fn spawn_terminal(command: &str) {
         }
         Err(err) => warn!(?err, program, "failed to spawn terminal"),
     }
+}
+
+/// Query current volume from wpctl. Returns (volume_0_to_1, is_muted).
+fn query_volume() -> (f32, bool) {
+    let output = Command::new("wpctl")
+        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+        .output();
+
+    match output {
+        Ok(out) => {
+            // Output looks like: "Volume: 0.50" or "Volume: 0.50 [MUTED]"
+            let text = String::from_utf8_lossy(&out.stdout);
+            let muted = text.contains("[MUTED]");
+            let vol = text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            (vol, muted)
+        }
+        Err(_) => (0.0, false),
+    }
+}
+
+/// Query current brightness from brightnessctl. Returns 0.0–1.0.
+fn query_brightness() -> f32 {
+    let current = Command::new("brightnessctl")
+        .args(["get"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
+
+    let max = Command::new("brightnessctl")
+        .args(["max"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f32>().ok())
+        .unwrap_or(1.0);
+
+    if max > 0.0 { (current / max).clamp(0.0, 1.0) } else { 0.0 }
 }
