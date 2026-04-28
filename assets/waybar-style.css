@@ -9,8 +9,11 @@
 window#waybar {
     background: transparent;
     color: @fg_color;
-    font-family: "JetBrainsMono Nerd Font", "Noto Sans CJK JP", monospace;
-    font-size: 13px;
+    font-family: "Ubuntu Sans", "Noto Sans", "DejaVu Sans",
+                 "Symbols Nerd Font Mono", "Symbols Nerd Font",
+                 "Font Awesome 6 Free", "Font Awesome 5 Free", "FontAwesome",
+                 "Noto Sans Symbols2", "Noto Sans Symbols", sans-serif;
+    font-size: 12px;
     font-weight: 500;
 }
 
@@ -138,31 +141,33 @@ tooltip label {
     padding: 0 18px;
 }
 
-/* ── Pulseaudio ── */
+/* ── System status icons ──
+   Rendered in the foreground tone (white on dark themes, dark on light)
+   so they read like real system-tray glyphs rather than colored accents.
+   Only urgent states (mute, disconnected, low battery) shift hue. */
+
 #pulseaudio {
-    color: @green_color;
+    color: @fg_color;
 }
 
 #pulseaudio.muted {
     color: @fg_dim_color;
 }
 
-/* ── Network ── */
 #network {
-    color: @cyan_color;
+    color: @fg_color;
 }
 
 #network.disconnected {
-    color: @orange_color;
+    color: @fg_dim_color;
 }
 
-/* ── Battery ── */
 #battery {
-    color: @teal_color;
+    color: @fg_color;
 }
 
 #battery.good {
-    color: @success_color;
+    color: @fg_color;
 }
 
 #battery.warning {
@@ -176,7 +181,7 @@ tooltip label {
 
 #battery.charging,
 #battery.plugged {
-    color: @success_color;
+    color: @fg_bright_color;
 }
 
 @keyframes pulse {

@@ -684,22 +684,60 @@ function cycle_theme()
           t.name, t.active, t.inactive))
 end
 
--- ── Navbar toggle ──
-w.__navbar_position = "top"
-w.__navbar_visible  = true
+-- ── Navbar position cycler ──
+-- Cycles through the four screen edges: top → right → bottom → left → top
+local navbar_positions = { "top", "right", "bottom", "left" }
+w.__navbar_pos_index = 1
+w.__navbar_position  = navbar_positions[w.__navbar_pos_index]
+
+local function rewrite_waybar_position(new_pos)
+    -- Pick the right template: horizontal bars use full text + icons,
+    -- vertical bars use a stripped icon-only config so the bar fits in
+    -- ~38px width instead of growing to 270px to fit horizontal text.
+    local is_vertical = (new_pos == "left" or new_pos == "right")
+    local template = is_vertical and "config-vertical" or "config-horizontal"
+    local src = waybar_config_dir() .. "/" .. template
+    local dst = waybar_config_dir() .. "/config"
+
+    local f = io.open(src, "r")
+    if not f then
+        print("toggle_navbar: cannot read " .. src)
+        return false
+    end
+    local content = f:read("*a")
+    f:close()
+
+    -- Patch position to the requested edge (the template defaults to top/right)
+    local count
+    content, count = content:gsub('"position"%s*:%s*"[^"]*"',
+                                  '"position": "' .. new_pos .. '"', 1)
+    if count == 0 then
+        print("toggle_navbar: no position field in " .. src)
+        return false
+    end
+
+    f = io.open(dst, "w")
+    if not f then
+        print("toggle_navbar: cannot write " .. dst)
+        return false
+    end
+    f:write(content)
+    f:close()
+    return true
+end
 
 function toggle_navbar()
-    if w.__navbar_visible then
-        os.execute("pkill -x waybar 2>/dev/null")
-        w.__navbar_visible = false
-        print("navbar -> hidden")
-    else
-        w.__navbar_position = (w.__navbar_position == "top")
-                              and "bottom" or "top"
-        os.execute("pkill -x waybar 2>/dev/null; sleep 0.2; setsid waybar &")
-        w.__navbar_visible = true
-        print("navbar -> " .. w.__navbar_position)
+    w.__navbar_pos_index = (w.__navbar_pos_index % #navbar_positions) + 1
+    local new_pos = navbar_positions[w.__navbar_pos_index]
+    w.__navbar_position = new_pos
+
+    if not rewrite_waybar_position(new_pos) then
+        return
     end
+
+    os.execute("pkill -x waybar 2>/dev/null; sleep 0.4; "
+               .. "setsid /bin/bash -c 'exec waybar > /tmp/waybar-stderr.log 2>&1' &")
+    print("navbar -> " .. new_pos)
 end
 
 -- ── Autostart ──

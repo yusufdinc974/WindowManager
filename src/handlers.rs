@@ -571,26 +571,24 @@ impl WlrLayerShellHandler for State {
             .and_then(Output::from_resource)
             .unwrap_or_else(|| self.output.clone());
 
-        // ── Phase 34: Pre-configure layer surfaces that request size 0 ──
-        // Some clients (SwayOSD, etc.) create overlay surfaces with width/height
-        // set to 0, expecting the compositor to assign the output dimensions.
-        // Smithay strictly validates that size-0 requires both anchors.
-        // We work around this by sending a configure with the output size
-        // before the map, so the client always has valid dimensions.
+        // ── Phase 34: Pre-configure fully-unsized overlay surfaces ──
+        // Some clients (SwayOSD, etc.) create overlays with size=(0,0) and no
+        // anchors, expecting the compositor to fill in output dimensions.
+        // Only fire when BOTH dimensions are zero — for clients that use a
+        // single zero dimension (e.g. waybar vertical: (38,0), horizontal:
+        // (0,38)), smithay's anchor-based sizing must be left alone, otherwise
+        // the bar gets force-stretched to full output and ends up off-screen
+        // or overlapping windows.
         let output_geo = self.workspaces[self.active_workspace]
             .space
             .output_geometry(&output)
             .unwrap_or_default();
 
         surface.with_pending_state(|state| {
-            let mut size = state.size.unwrap_or_default();
-            if size.w == 0 {
-                size.w = output_geo.size.w;
+            let size = state.size.unwrap_or_default();
+            if size.w == 0 && size.h == 0 {
+                state.size = Some((output_geo.size.w, output_geo.size.h).into());
             }
-            if size.h == 0 {
-                size.h = output_geo.size.h;
-            }
-            state.size = Some(size);
         });
 
         let layer = LayerSurface::new(surface, namespace);

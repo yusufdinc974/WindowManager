@@ -381,6 +381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(?socket_name, "listening for wayland clients");
 
     isolate_session_environment(&socket_name);
+    ensure_bundled_fonts();
     ensure_waybar_config();
 
     // Re-write correct theme CSS now that HOME points to sandbox
@@ -632,6 +633,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         workspace_transition: state::WorkspaceTransition::default(),
         window_opacity: 1.0,
         osd: state::OsdState::default(),
+        lock_screen: state::LockScreenState::default(),
+        power_menu: state::PowerMenuState::default(),
     };
 
     let mut data = CalloopData {
@@ -721,6 +724,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data.state.needs_redraw = true;
             }
 
+            // ── Tick lock screen fail flash ──
+            if data.state.lock_screen.active && data.state.lock_screen.fail_alpha() > 0.01 {
+                data.state.needs_redraw = true;
+            }
+
+            // ── Tick power menu fade-in ──
+            if data.state.power_menu.visible && data.state.power_menu.alpha() < 1.0 {
+                data.state.needs_redraw = true;
+            }
+
             if data.state.any_animating() {
                 data.state.recalculate_layout();
                 data.state.needs_redraw = true;
@@ -771,6 +784,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // -------------------------------------------------------------------------
+// ensure_bundled_fonts — installs Symbols Nerd Font Mono into the sandbox
+// home's user font dir and refreshes fontconfig so waybar (and any other
+// in-sandbox client) can render Nerd Font glyphs (- range).
+// -------------------------------------------------------------------------
+
+fn ensure_bundled_fonts() {
+    const FONT_NAME: &str = "SymbolsNerdFontMono-Regular.ttf";
+    const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        warn!("ensure_bundled_fonts: HOME is empty, skipping");
+        return;
+    }
+
+    let fonts_dir = format!("{}/.local/share/fonts", home);
+    if let Err(err) = std::fs::create_dir_all(&fonts_dir) {
+        warn!(?err, dir = %fonts_dir, "failed to create user fonts dir");
+        return;
+    }
+
+    let dest = format!("{}/{}", fonts_dir, FONT_NAME);
+    let needs_write = match std::fs::metadata(&dest) {
+        Ok(m) => m.len() != FONT_BYTES.len() as u64,
+        Err(_) => true,
+    };
+
+    if needs_write {
+        info!(path = %dest, bytes = FONT_BYTES.len(), "installing bundled Nerd Font");
+        if let Err(err) = std::fs::write(&dest, FONT_BYTES) {
+            warn!(?err, path = %dest, "failed to write bundled font");
+            return;
+        }
+    } else {
+        info!(path = %dest, "bundled Nerd Font already up-to-date");
+    }
+
+    // Refresh fontconfig so the new family is discoverable. fc-cache only
+    // walks dirs it already knows; passing the dir explicitly forces a scan.
+    match std::process::Command::new("fc-cache")
+        .args(["-f", &fonts_dir])
+        .status()
+    {
+        Ok(s) if s.success() => info!("fc-cache refreshed font index"),
+        Ok(s) => warn!(status = ?s, "fc-cache exited non-zero"),
+        Err(err) => warn!(?err, "fc-cache failed to spawn — font may not be visible until next login"),
+    }
+}
+
+// -------------------------------------------------------------------------
 // ensure_waybar_config — deploys Waybar + lumie scripts to isolated HOME
 // -------------------------------------------------------------------------
 
@@ -800,6 +863,12 @@ fn ensure_waybar_config() {
     let config_path = format!("{}/config", waybar_dir);
     info!(path = %config_path, "writing waybar config from asset");
     let _ = std::fs::write(&config_path, include_str!("../assets/waybar-config.json"));
+
+    let config_h_path = format!("{}/config-horizontal", waybar_dir);
+    let _ = std::fs::write(&config_h_path, include_str!("../assets/waybar-config.json"));
+
+    let config_v_path = format!("{}/config-vertical", waybar_dir);
+    let _ = std::fs::write(&config_v_path, include_str!("../assets/waybar-config-vertical.json"));
 
     let style_path = format!("{}/style.css", waybar_dir);
     info!(path = %style_path, "writing waybar style.css from asset");
@@ -1068,6 +1137,131 @@ fn render_frame(data: &mut CalloopData) {
 
     let mut all_elements: Vec<OutputRenderElements> = Vec::new();
 
+    let screen_height = state.workspaces[state.active_workspace]
+        .space
+        .output_geometry(&state.output)
+        .map(|g| g.size.h)
+        .unwrap_or(1080);
+
+    // ── Lock screen: render ONLY lock elements, skip everything else ──
+    if state.lock_screen.active {
+        let lock_elements = build_lock_screen_elements(
+            &state.lock_screen, screen_width, screen_height,
+        );
+        all_elements.extend(lock_elements);
+
+        // Skip all workspace / cursor / OSD rendering — go straight to compositor
+        match backend.compositor.render_frame::<_, _>(
+            &mut state.renderer, &all_elements,
+            Color32F::from([0.03, 0.02, 0.05, 1.0]),
+            FrameFlags::DEFAULT,
+        ) {
+            Ok(frame) => {
+                if frame.is_empty && state.lock_screen.fail_alpha() < 0.01 {
+                    state.needs_redraw = false;
+                } else if let Err(err) = backend.compositor.queue_frame(()) {
+                    warn!(?err, "DRM: queue_frame failed (lock screen)");
+                } else {
+                    backend.pending_frame = true;
+                    state.needs_redraw = false;
+                }
+            }
+            Err(err) => {
+                warn!(?err, "DRM: render_frame failed (lock screen)");
+            }
+        }
+
+        // Still send frame callbacks to keep clients alive
+        let elapsed = state.start_time.elapsed();
+        let output = state.output.clone();
+        state.workspaces[state.active_workspace]
+            .space
+            .elements()
+            .for_each(|window| {
+                window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+                    Some(output.clone())
+                });
+            });
+        {
+            let map = layer_map_for_output(&output);
+            for layer in map.layers() {
+                layer.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+                    Some(output.clone())
+                });
+            }
+        }
+        state.workspaces[state.active_workspace].space.refresh();
+        state.popups.cleanup();
+        if let Err(err) = state.display_handle.flush_clients() {
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                warn!(?err, "failed to flush wayland clients");
+            }
+        }
+        return;
+    }
+
+    // ── Power menu: render ONLY power menu elements, skip workspace ──
+    if state.power_menu.visible {
+        let pm_elements = build_power_menu_elements(
+            &state.power_menu, screen_width, screen_height,
+        );
+        all_elements.extend(pm_elements);
+
+        // Add cursor on top
+        let cursor_loc = state.pointer_location.to_i32_round().to_physical(1);
+        let cursor_elem = SolidColorRenderElement::from_buffer(
+            &state.cursor_buffer, cursor_loc, 1.0, 1.0, Kind::Cursor,
+        );
+        all_elements.push(OutputRenderElements::Cursor(cursor_elem));
+
+        match backend.compositor.render_frame::<_, _>(
+            &mut state.renderer, &all_elements,
+            Color32F::from([0.03, 0.02, 0.05, 1.0]),
+            FrameFlags::DEFAULT,
+        ) {
+            Ok(frame) => {
+                if frame.is_empty && state.power_menu.alpha() >= 1.0 {
+                    state.needs_redraw = false;
+                } else if let Err(err) = backend.compositor.queue_frame(()) {
+                    warn!(?err, "DRM: queue_frame failed (power menu)");
+                } else {
+                    backend.pending_frame = true;
+                    state.needs_redraw = false;
+                }
+            }
+            Err(err) => {
+                warn!(?err, "DRM: render_frame failed (power menu)");
+            }
+        }
+
+        let elapsed = state.start_time.elapsed();
+        let output = state.output.clone();
+        state.workspaces[state.active_workspace]
+            .space
+            .elements()
+            .for_each(|window| {
+                window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+                    Some(output.clone())
+                });
+            });
+        {
+            let map = layer_map_for_output(&output);
+            for layer in map.layers() {
+                layer.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+                    Some(output.clone())
+                });
+            }
+        }
+        state.workspaces[state.active_workspace].space.refresh();
+        state.popups.cleanup();
+        if let Err(err) = state.display_handle.flush_clients() {
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                warn!(?err, "failed to flush wayland clients");
+            }
+        }
+        return;
+    }
+
     // ── Cursor on top of everything ──
     let cursor_loc = state.pointer_location.to_i32_round().to_physical(1);
     let cursor_elem = SolidColorRenderElement::from_buffer(
@@ -1076,11 +1270,6 @@ fn render_frame(data: &mut CalloopData) {
     all_elements.push(OutputRenderElements::Cursor(cursor_elem));
 
     // ── OSD overlay (volume / brightness) — on top of workspace content ──
-    let screen_height = state.workspaces[state.active_workspace]
-        .space
-        .output_geometry(&state.output)
-        .map(|g| g.size.h)
-        .unwrap_or(1080);
     let osd_elements = build_osd_elements(&state.osd, screen_width, screen_height);
     all_elements.extend(osd_elements);
 
@@ -1776,6 +1965,537 @@ fn build_osd_elements(osd: &state::OsdState, screen_w: i32, screen_h: i32) -> Ve
         let elem = SolidColorRenderElement::from_buffer(
             &buf,
             Point::<i32, Physical>::from((dot_x + icon_size / 2 - 1, dot_y)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+    }
+
+    elements
+}
+
+// -------------------------------------------------------------------------
+// Lock Screen rendering
+// -------------------------------------------------------------------------
+
+// -------------------------------------------------------------------------
+// Lock Screen rendering
+// -------------------------------------------------------------------------
+
+fn build_lock_screen_elements(
+    lock: &state::LockScreenState,
+    screen_w: i32,
+    screen_h: i32,
+) -> Vec<OutputRenderElements> {
+    let mut elements = Vec::new();
+
+    // ── Full-screen solid background (completely opaque) ──
+    let bg_color = [0.03, 0.02, 0.05, 1.0];
+    let bg_buf = SolidColorBuffer::new((screen_w, screen_h), bg_color);
+    let bg_elem = SolidColorRenderElement::from_buffer(
+        &bg_buf,
+        Point::<i32, Physical>::from((0, 0)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(bg_elem));
+
+    // ── Subtle gradient-like horizontal band across center ──
+    let band_h: i32 = 200;
+    let band_y = (screen_h - band_h) / 2;
+    let band_color = [0.06, 0.04, 0.10, 1.0];
+    let band_buf = SolidColorBuffer::new((screen_w, band_h), band_color);
+    let band_elem = SolidColorRenderElement::from_buffer(
+        &band_buf,
+        Point::<i32, Physical>::from((0, band_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(band_elem));
+
+    // ── Centered password input panel ──
+    let panel_w: i32 = 340;
+    let panel_h: i32 = 60;
+    let px = (screen_w - panel_w) / 2;
+    let py = (screen_h - panel_h) / 2;
+
+    // Panel background
+    let panel_bg = [0.08, 0.06, 0.12, 1.0];
+    let panel_buf = SolidColorBuffer::new((panel_w, panel_h), panel_bg);
+    let panel_elem = SolidColorRenderElement::from_buffer(
+        &panel_buf,
+        Point::<i32, Physical>::from((px, py)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(panel_elem));
+
+    // ── Panel border (color changes based on state) ──
+    let border_color = if lock.auth_in_progress {
+        [0.48, 0.64, 0.97, 0.8] // blue - authenticating
+    } else if lock.failed {
+        let fa = lock.fail_alpha();
+        [0.97, 0.30, 0.35, 0.4 + 0.6 * fa] // red flash
+    } else if !lock.password_buffer.is_empty() {
+        [0.48, 0.64, 0.97, 0.5] // blue - typing
+    } else {
+        [0.25, 0.25, 0.35, 0.5] // dim - idle
+    };
+    let bw: i32 = 2;
+
+    // Top border
+    let buf = SolidColorBuffer::new((panel_w, bw), border_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((px, py)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+    // Bottom border
+    let buf = SolidColorBuffer::new((panel_w, bw), border_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((px, py + panel_h - bw)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+    // Left border
+    let buf = SolidColorBuffer::new((bw, panel_h), border_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((px, py)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+    // Right border
+    let buf = SolidColorBuffer::new((bw, panel_h), border_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((px + panel_w - bw, py)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+
+    // ── Password dots ──
+    let dot_size: i32 = 10;
+    let dot_gap: i32 = 10;
+    let char_count = lock.password_buffer.len().min(24) as i32;
+
+    if char_count > 0 {
+        let dots_total_w = char_count * dot_size + (char_count - 1) * dot_gap;
+        let dots_x = px + (panel_w - dots_total_w) / 2;
+        let dots_y = py + (panel_h - dot_size) / 2;
+
+        let dot_color = if lock.failed {
+            let fa = lock.fail_alpha();
+            [0.97, 0.30, 0.35, 0.5 + 0.5 * fa]
+        } else {
+            [0.75, 0.80, 0.95, 0.9]
+        };
+
+        for i in 0..char_count {
+            let dx = dots_x + i * (dot_size + dot_gap);
+            let dot_buf = SolidColorBuffer::new((dot_size, dot_size), dot_color);
+            let dot_elem = SolidColorRenderElement::from_buffer(
+                &dot_buf,
+                Point::<i32, Physical>::from((dx, dots_y)),
+                1.0, 1.0, Kind::Unspecified,
+            );
+            elements.push(OutputRenderElements::Cursor(dot_elem));
+        }
+    } else if !lock.auth_in_progress {
+        // ── Blinking cursor line when empty ──
+        let line_w: i32 = 2;
+        let line_h: i32 = 24;
+        let lx = px + (panel_w - line_w) / 2;
+        let ly = py + (panel_h - line_h) / 2;
+        let line_color = [0.4, 0.4, 0.55, 0.6];
+        let line_buf = SolidColorBuffer::new((line_w, line_h), line_color);
+        let line_elem = SolidColorRenderElement::from_buffer(
+            &line_buf,
+            Point::<i32, Physical>::from((lx, ly)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(line_elem));
+    }
+
+    // ── Status indicator below panel ──
+    let indicator_w: i32 = 40;
+    let indicator_h: i32 = 3;
+    let ind_x = px + (panel_w - indicator_w) / 2;
+    let ind_y = py + panel_h + 12;
+
+    let ind_color = if lock.auth_in_progress {
+        [0.48, 0.64, 0.97, 0.9] // blue - checking
+    } else if lock.failed {
+        let fa = lock.fail_alpha();
+        [0.97, 0.30, 0.35, fa] // red - failed
+    } else if !lock.password_buffer.is_empty() {
+        [0.48, 0.64, 0.97, 0.4] // dim blue - has input
+    } else {
+        [0.2, 0.2, 0.3, 0.3] // very dim - idle
+    };
+
+    let ind_buf = SolidColorBuffer::new((indicator_w, indicator_h), ind_color);
+    let ind_elem = SolidColorRenderElement::from_buffer(
+        &ind_buf,
+        Point::<i32, Physical>::from((ind_x, ind_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(ind_elem));
+
+    // ── Lock icon above panel (simple padlock shape) ──
+    let icon_y = py - 50;
+    let icon_cx = px + panel_w / 2;
+
+    // Padlock body (filled rectangle)
+    let body_w: i32 = 24;
+    let body_h: i32 = 18;
+    let body_x = icon_cx - body_w / 2;
+    let body_y = icon_y + 14;
+    let icon_color = [0.35, 0.35, 0.50, 0.7];
+    let buf = SolidColorBuffer::new((body_w, body_h), icon_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((body_x, body_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+
+    // Padlock shackle (U-shape: left, top, right bars)
+    let sh_outer_w: i32 = 16;
+    let sh_h: i32 = 12;
+    let sh_bar: i32 = 3;
+    let sh_x = icon_cx - sh_outer_w / 2;
+    let sh_y = icon_y;
+    // Left bar
+    let buf = SolidColorBuffer::new((sh_bar, sh_h), icon_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((sh_x, sh_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+    // Right bar
+    let buf = SolidColorBuffer::new((sh_bar, sh_h), icon_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((sh_x + sh_outer_w - sh_bar, sh_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+    // Top bar
+    let buf = SolidColorBuffer::new((sh_outer_w, sh_bar), icon_color);
+    let elem = SolidColorRenderElement::from_buffer(
+        &buf, Point::<i32, Physical>::from((sh_x, sh_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(elem));
+
+    elements
+}
+
+// -------------------------------------------------------------------------
+// Power Menu rendering
+// -------------------------------------------------------------------------
+
+fn build_power_menu_elements(
+    pm: &state::PowerMenuState,
+    screen_w: i32,
+    screen_h: i32,
+) -> Vec<OutputRenderElements> {
+    let mut elements = Vec::new();
+
+    // ── Solid dark background ──
+    let bg_color = [0.04, 0.03, 0.07, 1.0];
+    let bg_buf = SolidColorBuffer::new((screen_w, screen_h), bg_color);
+    let bg_elem = SolidColorRenderElement::from_buffer(
+        &bg_buf,
+        Point::<i32, Physical>::from((0, 0)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(bg_elem));
+
+    // ── Subtle horizontal band ──
+    let band_h: i32 = 180;
+    let band_y = (screen_h - band_h) / 2 - 20;
+    let band_color = [0.07, 0.05, 0.11, 1.0];
+    let band_buf = SolidColorBuffer::new((screen_w, band_h), band_color);
+    let band_elem = SolidColorRenderElement::from_buffer(
+        &band_buf,
+        Point::<i32, Physical>::from((0, band_y)),
+        1.0, 1.0, Kind::Unspecified,
+    );
+    elements.push(OutputRenderElements::Cursor(band_elem));
+
+    // ── Option boxes ──
+    let options = state::PowerMenuOption::ALL;
+    let count = options.len() as i32;
+    let box_w: i32 = 90;
+    let box_h: i32 = 90;
+    let gap: i32 = 24;
+    let total_w = count * box_w + (count - 1) * gap;
+    let start_x = (screen_w - total_w) / 2;
+    let box_y = (screen_h - box_h) / 2 - 20;
+
+    for (i, option) in options.iter().enumerate() {
+        let bx = start_x + i as i32 * (box_w + gap);
+        let is_selected = i == pm.selected;
+        let base = option.color();
+
+        // ── Selection glow ──
+        if is_selected {
+            let glow: i32 = 5;
+            let gc = [base[0] * 0.4, base[1] * 0.4, base[2] * 0.4, 0.6];
+            let buf = SolidColorBuffer::new((box_w + 2 * glow, box_h + 2 * glow), gc);
+            let elem = SolidColorRenderElement::from_buffer(
+                &buf,
+                Point::<i32, Physical>::from((bx - glow, box_y - glow)),
+                1.0, 1.0, Kind::Unspecified,
+            );
+            elements.push(OutputRenderElements::Cursor(elem));
+        }
+
+        // ── Box background ──
+        let box_bg = if is_selected {
+            [base[0] * 0.25, base[1] * 0.25, base[2] * 0.25, 0.35]
+        } else {
+            [0.10, 0.08, 0.14, 0.9]
+        };
+        let buf = SolidColorBuffer::new((box_w, box_h), box_bg);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((bx, box_y)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+
+        // ── Box border ──
+        let bc = if is_selected {
+            [base[0] * 0.9, base[1] * 0.9, base[2] * 0.9, 0.9]
+        } else {
+            [0.25, 0.25, 0.35, 0.5]
+        };
+        let bw: i32 = if is_selected { 2 } else { 1 };
+        // Top
+        let buf = SolidColorBuffer::new((box_w, bw), bc);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf, Point::<i32, Physical>::from((bx, box_y)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+        // Bottom
+        let buf = SolidColorBuffer::new((box_w, bw), bc);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf, Point::<i32, Physical>::from((bx, box_y + box_h - bw)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+        // Left
+        let buf = SolidColorBuffer::new((bw, box_h), bc);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf, Point::<i32, Physical>::from((bx, box_y)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+        // Right
+        let buf = SolidColorBuffer::new((bw, box_h), bc);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf, Point::<i32, Physical>::from((bx + box_w - bw, box_y)),
+            1.0, 1.0, Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::Cursor(elem));
+
+        // ── Icon ──
+        let ic = if is_selected {
+            [base[0], base[1], base[2], 1.0]
+        } else {
+            [0.55, 0.55, 0.70, 0.85]
+        };
+        let icon_cx = bx + box_w / 2;
+        let icon_cy = box_y + box_h / 2 - 2;
+
+        match option {
+            state::PowerMenuOption::Lock => {
+                // Padlock body
+                let body_w: i32 = 18;
+                let body_h: i32 = 12;
+                let buf = SolidColorBuffer::new((body_w, body_h), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((icon_cx - body_w/2, icon_cy + 2)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                // Shackle
+                let bar = 3;
+                let sh_w: i32 = 12;
+                let sh_h: i32 = 8;
+                let sh_x = icon_cx - sh_w / 2;
+                let sh_y = icon_cy - sh_h + 2;
+                let buf = SolidColorBuffer::new((bar, sh_h), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((sh_x, sh_y)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((bar, sh_h), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((sh_x + sh_w - bar, sh_y)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((sh_w, bar), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((sh_x, sh_y)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+            }
+            state::PowerMenuOption::Sleep => {
+                // Moon crescent
+                let s: i32 = 20;
+                let buf = SolidColorBuffer::new((s, s), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((icon_cx - s/2 - 2, icon_cy - s/2)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let cs: i32 = 16;
+                let dark = [0.04, 0.03, 0.07, 1.0];
+                let buf = SolidColorBuffer::new((cs, cs), dark);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((icon_cx - s/2 + 6, icon_cy - s/2 - 3)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+            }
+            state::PowerMenuOption::Reboot => {
+                // Ring with gap + arrow
+                let s: i32 = 20;
+                let bar: i32 = 3;
+                let rx = icon_cx - s / 2;
+                let ry = icon_cy - s / 2;
+                let buf = SolidColorBuffer::new((s, bar), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx, ry)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((s, bar), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx, ry + s - bar)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((bar, s), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx, ry)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((bar, s), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx + s - bar, ry)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                // Arrow tip
+                let buf = SolidColorBuffer::new((6, 3), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx + s - 4, ry - 4)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                // Gap
+                let buf = SolidColorBuffer::new((6, bar), [0.04, 0.03, 0.07, 1.0]);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx + s - 8, ry)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+            }
+            state::PowerMenuOption::Shutdown => {
+                // Power symbol
+                let s: i32 = 20;
+                let bar: i32 = 3;
+                let rx = icon_cx - s / 2;
+                let ry = icon_cy - s / 2;
+                let lx = icon_cx - bar / 2;
+                let buf = SolidColorBuffer::new((bar, s / 2 + 2), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((lx, ry - 2)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((s, bar), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx, ry + s - bar)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((bar, s / 2), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx, ry + s / 2)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((bar, s / 2), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((rx + s - bar, ry + s / 2)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+            }
+            state::PowerMenuOption::Logout => {
+                // Door + arrow
+                let s: i32 = 20;
+                let bar: i32 = 3;
+                let dx = icon_cx - s / 2;
+                let dy = icon_cy - s / 2;
+                let buf = SolidColorBuffer::new((s / 2, bar), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((dx, dy)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((s / 2, bar), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((dx, dy + s - bar)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((bar, s), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((dx, dy)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let arrow_w: i32 = 10;
+                let ay = icon_cy - bar / 2;
+                let buf = SolidColorBuffer::new((arrow_w, bar), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((icon_cx + 2, ay)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((bar, 5), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((icon_cx + arrow_w, ay - 4)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+                let buf = SolidColorBuffer::new((bar, 5), ic);
+                let elem = SolidColorRenderElement::from_buffer(
+                    &buf, Point::<i32, Physical>::from((icon_cx + arrow_w, ay + bar)),
+                    1.0, 1.0, Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::Cursor(elem));
+            }
+        }
+
+        // ── Selection indicator bar below box ──
+        let ind_h: i32 = 3;
+        let ind_w: i32 = if is_selected { 30 } else { 16 };
+        let ind_x = bx + (box_w - ind_w) / 2;
+        let ind_y = box_y + box_h + 10;
+        let nc = if is_selected {
+            [base[0], base[1], base[2], 0.9]
+        } else {
+            [0.25, 0.25, 0.35, 0.4]
+        };
+        let buf = SolidColorBuffer::new((ind_w, ind_h), nc);
+        let elem = SolidColorRenderElement::from_buffer(
+            &buf,
+            Point::<i32, Physical>::from((ind_x, ind_y)),
             1.0, 1.0, Kind::Unspecified,
         );
         elements.push(OutputRenderElements::Cursor(elem));

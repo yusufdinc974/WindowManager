@@ -258,3 +258,15 @@ action = "brightness_up"
 modifiers = {}
 key = "f11"
 action = "brightness_down"
+
+# ── Lock Screen & Power Menu ──
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "l"
+action = "lock_screen"
+
+[[keybinds]]
+modifiers = { logo = true }
+key = "Escape"
+action = "toggle_power_menu"

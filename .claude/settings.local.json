@@ -4,7 +4,20 @@
       "Read(//home/sicakahve/.cargo/git/checkouts/smithay-312425d48e59d8c8/dba255c/src/**)",
       "Bash(cargo build *)",
       "Read(//usr/bin/**)",
-      "Bash(apt list *)"
+      "Bash(apt list *)",
+      "Bash(cargo check *)",
+      "Bash(awk 'NR==54 || NR==71 || NR==72 || NR==73 || NR==83 || NR==84 || NR==85 || NR==98 || NR==99 || NR==100 {printf \"L%d: \",NR; for\\(i=1;i<=length\\($0\\);i++\\){c=substr\\($0,i,1\\); printf \"%s\",c}; printf \"\\\\n\"}' /home/sicakahve/Desktop/Lumie/assets/waybar-config.json)",
+      "Bash(python3 -c ' *)",
+      "Bash(fc-list)",
+      "Bash(pip install *)",
+      "Bash(python3)",
+      "Read(//tmp/**)",
+      "Bash(apt-cache search *)",
+      "Bash(dpkg -l fonts-font-awesome)",
+      "Read(//usr/share/fonts/truetype/**)",
+      "Read(//usr/share/fonts/opentype/**)",
+      "Bash(sudo -n apt-get install -y fonts-font-awesome)",
+      "Bash(sudo apt-get *)"
     ]
   }
 }

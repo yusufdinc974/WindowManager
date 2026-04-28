@@ -17,29 +17,23 @@ smithay = { git = "https://github.com/Smithay/smithay", default-features = false
     "backend_udev",
     "backend_drm",
     "backend_gbm",
-    
 ] }
 
 toml = "0.8"
-
 libc = "0.2"
-
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
 mlua = { version = "0.9", features = ["lua54", "vendored", "serialize"] }
-
 thiserror = "1"
 
 [profile.dev]
 opt-level = 1
 
 [profile.release]
-opt-level = 3        # Maximum speed optimization
-lto = "fat"          # Full cross-crate link-time optimization
-codegen-units = 1    # Single codegen unit — best LLVM optimization
-strip = true         # Strip debug symbols — smaller binary
-panic = "abort"      # No unwinding overhead — smaller + faster
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

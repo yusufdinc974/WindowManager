@@ -54,6 +54,155 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::layout::LayoutType;
 
+// ── Lock Screen ──
+
+#[derive(Debug, Clone)]
+pub struct LockScreenState {
+    pub active: bool,
+    pub password_buffer: String,
+    pub failed: bool,
+    pub fail_time: Option<Instant>,
+    pub auth_in_progress: bool,
+}
+
+impl Default for LockScreenState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            password_buffer: String::new(),
+            failed: false,
+            fail_time: None,
+            auth_in_progress: false,
+        }
+    }
+}
+
+impl LockScreenState {
+    pub fn activate(&mut self) {
+        self.active = true;
+        self.password_buffer.clear();
+        self.failed = false;
+        self.fail_time = None;
+        self.auth_in_progress = false;
+        info!("lock screen: activated");
+    }
+
+    pub fn deactivate(&mut self) {
+        self.active = false;
+        self.password_buffer.clear();
+        self.failed = false;
+        info!("lock screen: deactivated");
+    }
+
+    pub fn fail_alpha(&self) -> f32 {
+        match self.fail_time {
+            Some(t) => {
+                let elapsed = t.elapsed().as_secs_f32();
+                if elapsed > 1.0 { 0.0 } else { 1.0 - elapsed }
+            }
+            None => 0.0,
+        }
+    }
+}
+
+// ── Power Menu ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerMenuOption {
+    Lock,
+    Sleep,
+    Reboot,
+    Shutdown,
+    Logout,
+}
+
+impl PowerMenuOption {
+    pub const ALL: &'static [PowerMenuOption] = &[
+        PowerMenuOption::Lock,
+        PowerMenuOption::Sleep,
+        PowerMenuOption::Reboot,
+        PowerMenuOption::Shutdown,
+        PowerMenuOption::Logout,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Lock => "Lock",
+            Self::Sleep => "Sleep",
+            Self::Reboot => "Reboot",
+            Self::Shutdown => "Shutdown",
+            Self::Logout => "Logout",
+        }
+    }
+
+    pub fn color(&self) -> [f32; 4] {
+        match self {
+            Self::Lock     => [0.48, 0.64, 0.97, 1.0],
+            Self::Sleep    => [0.73, 0.60, 0.97, 1.0],
+            Self::Reboot   => [0.88, 0.69, 0.41, 1.0],
+            Self::Shutdown => [0.97, 0.47, 0.55, 1.0],
+            Self::Logout   => [0.45, 0.86, 0.79, 1.0],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PowerMenuState {
+    pub visible: bool,
+    pub selected: usize,
+    pub fade_in_time: Option<Instant>,
+}
+
+impl Default for PowerMenuState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            selected: 0,
+            fade_in_time: None,
+        }
+    }
+}
+
+impl PowerMenuState {
+    pub fn show(&mut self) {
+        self.visible = true;
+        self.selected = 0;
+        self.fade_in_time = Some(Instant::now());
+        info!("power menu: opened");
+    }
+
+    pub fn hide(&mut self) {
+        self.visible = false;
+        info!("power menu: closed");
+    }
+
+    pub fn selected_option(&self) -> PowerMenuOption {
+        PowerMenuOption::ALL[self.selected]
+    }
+
+    pub fn select_next(&mut self) {
+        self.selected = (self.selected + 1) % PowerMenuOption::ALL.len();
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.selected == 0 {
+            self.selected = PowerMenuOption::ALL.len() - 1;
+        } else {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn alpha(&self) -> f32 {
+        match self.fade_in_time {
+            Some(t) => {
+                let elapsed = t.elapsed().as_secs_f32();
+                (elapsed / 0.2).min(1.0)
+            }
+            None => 1.0,
+        }
+    }
+}
+
 pub const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.08, 0.05, 0.14, 1.0];
 pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
 pub const ANIMATION_START_SCALE: f32 = 0.8;
@@ -600,6 +749,9 @@ pub struct State {
     // ── Phase 29: Global window opacity (controlled via IPC / Waybar) ──
         pub window_opacity: f32,
         pub osd: OsdState,
+        pub lock_screen: LockScreenState,
+        pub power_menu: PowerMenuState,
+
 }
 #[derive(Default)]
 pub struct ClientState {
@@ -997,6 +1149,93 @@ impl State {
         let tmp = format!("{}.tmp", path);
         if let Ok(()) = std::fs::write(&tmp, format!("{}\n", json)) {
             let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    pub fn verify_password(password: &str) -> bool {
+        let username = std::env::var("lumie_REAL_HOME")
+            .ok()
+            .and_then(|home| {
+                std::path::Path::new(&home)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+            })
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "root".to_string());
+
+        info!(user = %username, "lock screen: attempting authentication");
+
+        // Use `su` to verify the password without any extra crate deps.
+        // `su -c true <user>` succeeds only if the password is correct.
+        let mut child = match std::process::Command::new("su")
+            .arg("-c")
+            .arg("true")
+            .arg(&username)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(?err, "lock screen: failed to spawn su");
+                return false;
+            }
+        };
+
+        // Write password to su's stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = writeln!(stdin, "{}", password);
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let success = status.success();
+                if success {
+                    info!(user = %username, "lock screen: auth success");
+                } else {
+                    warn!(user = %username, "lock screen: auth failed");
+                }
+                success
+            }
+            Err(err) => {
+                warn!(?err, "lock screen: su wait failed");
+                false
+            }
+        }
+    }
+
+    pub fn execute_power_action(&mut self, option: PowerMenuOption) {
+        self.power_menu.hide();
+        self.needs_redraw = true;
+
+        match option {
+            PowerMenuOption::Lock => {
+                self.lock_screen.activate();
+            }
+            PowerMenuOption::Sleep => {
+                info!("power menu: suspending system");
+                let _ = std::process::Command::new("systemctl")
+                    .arg("suspend")
+                    .spawn();
+            }
+            PowerMenuOption::Reboot => {
+                info!("power menu: rebooting system");
+                let _ = std::process::Command::new("systemctl")
+                    .arg("reboot")
+                    .spawn();
+            }
+            PowerMenuOption::Shutdown => {
+                info!("power menu: shutting down system");
+                let _ = std::process::Command::new("systemctl")
+                    .arg("poweroff")
+                    .spawn();
+            }
+            PowerMenuOption::Logout => {
+                info!("power menu: logging out");
+                self.loop_signal.stop();
+            }
         }
     }
 }

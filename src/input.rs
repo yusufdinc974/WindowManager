@@ -28,8 +28,7 @@ use smithay::{
 
 use tracing::{debug, info, trace, warn};
 
-use crate::state::{window_current_size, GrabMode, GrabState, State};
-
+use crate::state::{window_current_size, GrabMode, GrabState, PowerMenuOption, State};
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 
@@ -67,8 +66,11 @@ pub enum KeyAction {
     VolumeMute,
     BrightnessUp,
     BrightnessDown,
+    LockScreen,
+    TogglePowerMenu,
     /// Intercepted but already handled inline by the keyboard filter.
     NoOp,
+
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -186,6 +188,8 @@ fn action_string_to_key_action(action: &str) -> Option<KeyAction> {
         "volume_mute" => Some(KeyAction::VolumeMute),
         "brightness_up" => Some(KeyAction::BrightnessUp),
         "brightness_down" => Some(KeyAction::BrightnessDown),
+        "lock_screen" => Some(KeyAction::LockScreen),
+        "toggle_power_menu" => Some(KeyAction::TogglePowerMenu),
         // ── Phase 34: exec:<command> runs an arbitrary shell command ──
         s if s.starts_with("exec:") => {
             let cmd = s.strip_prefix("exec:").unwrap_or("").trim();
@@ -471,6 +475,18 @@ fn dispatch_action(state: &mut State, action: Option<KeyAction>) {
             state.osd.show(crate::state::OsdKind::Brightness, bri, false);
             state.needs_redraw = true;
         }
+        KeyAction::LockScreen => {
+            state.lock_screen.activate();
+            state.needs_redraw = true;
+        }
+        KeyAction::TogglePowerMenu => {
+            if state.power_menu.visible {
+                state.power_menu.hide();
+            } else {
+                state.power_menu.show();
+            }
+            state.needs_redraw = true;
+        }
         KeyAction::NoOp => {}
         }
 }
@@ -532,6 +548,49 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
             let keycode = event.key_code();
             let key_state = event.state();
 
+            // ── Lock screen: intercept ALL input ──
+            if state.lock_screen.active {
+                if key_state != KeyState::Pressed {
+                    return;
+                }
+                let keyboard = state.keyboard.clone();
+                keyboard.input::<(), _>(
+                    state,
+                    keycode,
+                    key_state,
+                    serial,
+                    time,
+                    |state, _mods, keysym_handle| {
+                        let sym = keysym_handle.modified_sym();
+                        handle_lock_screen_key(state, sym);
+                        FilterResult::Intercept(())
+                    },
+                );
+                return;
+            }
+
+            // ── Power menu: intercept ALL input ──
+            if state.power_menu.visible {
+                if key_state != KeyState::Pressed {
+                    return;
+                }
+                let keyboard = state.keyboard.clone();
+                keyboard.input::<(), _>(
+                    state,
+                    keycode,
+                    key_state,
+                    serial,
+                    time,
+                    |state, _mods, keysym_handle| {
+                        let sym = keysym_handle.modified_sym();
+                        handle_power_menu_key(state, sym);
+                        FilterResult::Intercept(())
+                    },
+                );
+                return;
+            }
+
+            // ── Normal keyboard handling ──
             let keyboard = state.keyboard.clone();
             let action = keyboard.input::<KeyAction, _>(
                 state,
@@ -547,6 +606,10 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
         }
 
         InputEvent::PointerMotion { event } => {
+            if state.lock_screen.active {
+                return;
+            }
+
             state.pointer_location.x += event.delta_x();
             state.pointer_location.y += event.delta_y();
 
@@ -722,8 +785,20 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
 
             state.needs_redraw = true;
         }
-
         InputEvent::PointerButton { event } => {
+            if state.lock_screen.active {
+                return;
+            }
+
+            if state.power_menu.visible {
+                let button_state_val = event.state();
+                if button_state_val == ButtonState::Pressed {
+                    let pos = state.pointer_location;
+                    handle_power_menu_click(state, pos);
+                }
+                return;
+            }
+
             let button = event.button_code();
             let button_state = event.state();
             let serial = SERIAL_COUNTER.next_serial();
@@ -1158,6 +1233,147 @@ pub fn handle_libinput_event(state: &mut State, event: InputEvent<LibinputInputB
 
         _ => {}
     }
+}
+
+// -------------------------------------------------------------------------
+// Lock screen key handler
+// -------------------------------------------------------------------------
+
+fn handle_lock_screen_key(state: &mut State, sym: Keysym) {
+    if state.lock_screen.auth_in_progress {
+        return;
+    }
+
+    match sym {
+        Keysym::Return | Keysym::KP_Enter => {
+            let password = state.lock_screen.password_buffer.clone();
+            if password.is_empty() {
+                return;
+            }
+
+            state.lock_screen.auth_in_progress = true;
+            state.needs_redraw = true;
+
+            let success = State::verify_password(&password);
+
+            if success {
+                info!("lock screen: authentication successful");
+                state.lock_screen.deactivate();
+            } else {
+                warn!("lock screen: authentication failed");
+                state.lock_screen.password_buffer.clear();
+                state.lock_screen.failed = true;
+                state.lock_screen.fail_time = Some(Instant::now());
+                state.lock_screen.auth_in_progress = false;
+            }
+            state.needs_redraw = true;
+        }
+        Keysym::Escape => {
+            state.lock_screen.password_buffer.clear();
+            state.lock_screen.failed = false;
+            state.needs_redraw = true;
+        }
+        Keysym::BackSpace => {
+            state.lock_screen.password_buffer.pop();
+            state.lock_screen.failed = false;
+            state.needs_redraw = true;
+        }
+        _ => {
+            if let Some(c) = sym.key_char() {
+                if !c.is_control() {
+                    state.lock_screen.password_buffer.push(c);
+                    state.lock_screen.failed = false;
+                    state.needs_redraw = true;
+                }
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Power menu key handler
+// -------------------------------------------------------------------------
+
+fn handle_power_menu_key(state: &mut State, sym: Keysym) {
+    match sym {
+        Keysym::Escape => {
+            state.power_menu.hide();
+            state.needs_redraw = true;
+        }
+        Keysym::Return | Keysym::KP_Enter => {
+            let option = state.power_menu.selected_option();
+            state.execute_power_action(option);
+        }
+        Keysym::Left | Keysym::h => {
+            state.power_menu.select_prev();
+            state.needs_redraw = true;
+        }
+        Keysym::Right | Keysym::l => {
+            state.power_menu.select_next();
+            state.needs_redraw = true;
+        }
+        Keysym::_1 => {
+            state.power_menu.selected = 0;
+            state.execute_power_action(PowerMenuOption::Lock);
+        }
+        Keysym::_2 => {
+            state.power_menu.selected = 1;
+            state.execute_power_action(PowerMenuOption::Sleep);
+        }
+        Keysym::_3 => {
+            state.power_menu.selected = 2;
+            state.execute_power_action(PowerMenuOption::Reboot);
+        }
+        Keysym::_4 => {
+            state.power_menu.selected = 3;
+            state.execute_power_action(PowerMenuOption::Shutdown);
+        }
+        Keysym::_5 => {
+            state.power_menu.selected = 4;
+            state.execute_power_action(PowerMenuOption::Logout);
+        }
+        _ => {}
+    }
+}
+
+// -------------------------------------------------------------------------
+// Power menu click handler
+// -------------------------------------------------------------------------
+
+fn handle_power_menu_click(state: &mut State, pos: Point<f64, Logical>) {
+    let screen_w = state.workspaces[state.active_workspace]
+        .space
+        .output_geometry(&state.output)
+        .map(|g| g.size.w)
+        .unwrap_or(1920);
+    let screen_h = state.workspaces[state.active_workspace]
+        .space
+        .output_geometry(&state.output)
+        .map(|g| g.size.h)
+        .unwrap_or(1080);
+
+    let count = PowerMenuOption::ALL.len() as i32;
+    let box_size: i32 = 100;
+    let gap: i32 = 30;
+    let total_w = count * box_size + (count - 1) * gap;
+    let start_x = (screen_w - total_w) / 2;
+    let box_y = (screen_h - box_size) / 2;
+
+    let px = pos.x as i32;
+    let py = pos.y as i32;
+
+    for (i, option) in PowerMenuOption::ALL.iter().enumerate() {
+        let bx = start_x + i as i32 * (box_size + gap);
+        if px >= bx && px <= bx + box_size && py >= box_y && py <= box_y + box_size {
+            state.power_menu.selected = i;
+            state.execute_power_action(*option);
+            return;
+        }
+    }
+
+    // Clicked outside → close
+    state.power_menu.hide();
+    state.needs_redraw = true;
 }
 
 // -------------------------------------------------------------------------

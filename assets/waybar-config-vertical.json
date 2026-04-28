@@ -1,8 +1,8 @@
 {
     "layer": "top",
-    "position": "top",
-    "height": 32,
-    "width": 0,
+    "position": "right",
+    "height": 0,
+    "width": 32,
     "margin-top": 6,
     "margin-bottom": 6,
     "margin-left": 12,
@@ -17,7 +17,6 @@
         "clock"
     ],
     "modules-right": [
-        "custom/layout",
         "custom/opacity",
         "pulseaudio",
         "network",
@@ -25,7 +24,7 @@
         "custom/power"
     ],
     "custom/logo": {
-        "format": "  ",
+        "format": "",
         "tooltip": false
     },
     "custom/workspaces": {
@@ -47,7 +46,7 @@
         "interval": 1,
         "exec": "cat ${XDG_RUNTIME_DIR:-/tmp}/lumie-opacity.json 2>/dev/null || echo '{\"text\":\"100%\",\"tooltip\":\"Opacity\",\"percentage\":100}'",
         "return-type": "json",
-        "format": " {}",
+        "format": "",
         "tooltip": true,
         "on-click": "bash $HOME/.config/lumie/scripts/lumie-opacity-control.sh",
         "on-click-right": "python3 -c \"import socket,json;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect('/tmp/lumie.sock');s.sendall(json.dumps({'SetOpacity':{'value':1.0}}).encode());s.close()\"",
@@ -56,15 +55,15 @@
         "escape": false
     },
     "clock": {
-        "format": "  {:%H:%M}",
-        "format-alt": "  {:%A, %B %d  %H:%M:%S}",
+        "format": "{:%H}\n{:%M}",
+        "format-alt": "{:%H}\n{:%M}",
         "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>",
         "interval": 1
     },
     "pulseaudio": {
-        "format": " {volume}%",
-        "format-bluetooth": " {volume}%",
-        "format-muted": " Mute",
+        "format": "",
+        "format-bluetooth": "",
+        "format-muted": "",
         "format-icons": {
             "default": [
                 ""
@@ -75,9 +74,9 @@
         "tooltip-format": "{desc}\n{volume}%"
     },
     "network": {
-        "format-wifi": " {signalStrength}%",
-        "format-ethernet": " {ifname}",
-        "format-disconnected": " Off",
+        "format-wifi": "",
+        "format-ethernet": "",
+        "format-disconnected": "",
         "tooltip-format-wifi": "{essid} ({signalStrength}%)\n{ipaddr}/{cidr}",
         "tooltip-format-ethernet": "{ifname}\n{ipaddr}/{cidr}",
         "tooltip-format-disconnected": "Disconnected",
@@ -89,16 +88,16 @@
             "warning": 30,
             "critical": 15
         },
-        "format": " {capacity}%",
-        "format-charging": " {capacity}%",
-        "format-plugged": " {capacity}%",
+        "format": "",
+        "format-charging": "",
+        "format-plugged": "",
         "format-icons": [
             ""
         ],
-        "tooltip-format": "{timeTo}\n{power:.1f}W"
+        "tooltip-format": "{capacity}% — {timeTo}\n{power:.1f}W"
     },
     "custom/power": {
-        "format": "  ",
+        "format": "",
         "tooltip": false,
         "on-click": "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/tmp/lumie.sock'); s.sendall(b'\\\"Quit\\\"'); s.close()\""
     }
